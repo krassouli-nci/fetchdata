@@ -16,8 +16,8 @@ This Python project retrieves security event logs from the Akamai SIEM API, deco
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/your-org/akamai-siem-processor.git
-cd akamai-siem-processor
+git clone https://github.com/krassouli-nci/AkamaiSecurityEvents.git
+cd AkamaiSecurityEvents
 ```
 
 ### 2. Create and activate a virtual environment
@@ -72,6 +72,10 @@ OUTPUT_MODE=sql   # Use 'sql' to store in MSSQL, or 'txt' for summary file outpu
 ```
 
 ## Running the Script
+
+#NOTE depending on where your odbc lib is running
+
+DYLD_LIBRARY_PATH="/Users/krassouli/homebrew/lib:/Users/krassouli/homebrew/Cellar/unixodbc/2.3.12/lib" python pullData.py
 
 Run the main script (replace `your_script_name.py` with the actual filename):
 
