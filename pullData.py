@@ -136,8 +136,10 @@ def reconnect(config, retry_wait=5, max_retries=5):
                 f"TrustServerCertificate=yes;Encrypt=yes;"
             )
             conn = pyodbc.connect(conn_str, timeout=30)
-            if hasattr(conn, "fast_executemany"):
+            try:
                 conn.fast_executemany = True
+            except Exception:
+                pass  # Not all drivers support it
             cursor = conn.cursor()
             return conn, cursor
         except pyodbc.Error as e:
@@ -153,6 +155,7 @@ def batch_insert(cursor, sql, data, config=None, batch_size=10000, table_name=""
         chunk = data[i:i+batch_size]
         retry = 0
         duplicates = 0
+        truncation = 0
         while retry < 5:
             try:
                 cursor.executemany(sql, chunk)
@@ -172,7 +175,7 @@ def batch_insert(cursor, sql, data, config=None, batch_size=10000, table_name=""
                     logging.exception(f"Operational error during insert into {table_name}:")
                     raise
             except pyodbc.IntegrityError as e:
-                # Fallback: Insert rows one by one; summarize duplicates per batch
+                # Fallback: Insert rows one by one; summarize duplicates/truncation per batch
                 for row in chunk:
                     row_retries = 0
                     while row_retries < 5:
@@ -188,7 +191,16 @@ def batch_insert(cursor, sql, data, config=None, batch_size=10000, table_name=""
                                 break
                             else:
                                 logging.exception(f"Database error during per-row insert into {table_name}:")
-                                raise
+                                break
+                        except pyodbc.DataError as data_e:
+                            if "22001" in str(data_e):
+                                truncation += 1
+                                if truncation == 1:
+                                    logging.warning(f"String truncation (22001) error for a row in {table_name}; further occurrences in this batch will be skipped silently.")
+                                break
+                            else:
+                                logging.error(f"DataError: {data_e}. Row was: {row}")
+                                break
                         except pyodbc.OperationalError as single_e:
                             if "08S01" in str(single_e) or "timeout" in str(single_e).lower():
                                 logging.warning(f"SQL connection lost or timed out during per-row insert ({single_e}); reconnecting and retrying...")
@@ -201,13 +213,15 @@ def batch_insert(cursor, sql, data, config=None, batch_size=10000, table_name=""
                                 continue
                             else:
                                 logging.exception(f"Operational error during per-row insert into {table_name}:")
-                                raise
+                                break
                         break
                 break
         label = f" for table '{table_name}'" if table_name else ""
         logging.info(f"Committed batch {i + len(chunk)} / {len(data)}{label}")
         if duplicates > 0:
             logging.info(f"Skipped {duplicates} duplicate key(s) in {table_name} in this batch.")
+        if truncation > 0:
+            logging.warning(f"Skipped {truncation} row(s) in {table_name} due to string truncation in this batch.")
 
 def write_to_mssql(config, events):
     conn, cursor = reconnect(config)
