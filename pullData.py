@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
+import time
 
 import requests
 import pyodbc
@@ -17,7 +18,6 @@ def setup_logging():
     log_dir = Path(__file__).resolve().parent / "logs"
     log_dir.mkdir(exist_ok=True)
     log_file = log_dir / "akamai_fetch.log"
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -30,7 +30,6 @@ def setup_logging():
 def load_config():
     env_path = Path(__file__).resolve().parent / ".env"
     load_dotenv(dotenv_path=env_path, override=True)
-
     required_vars = [
         "AKAMAI_CLIENT_TOKEN", "AKAMAI_CLIENT_SECRET", "AKAMAI_ACCESS_TOKEN",
         "AKAMAI_HOST", "AKAMAI_SIEM_CONFIG_ID"
@@ -40,7 +39,6 @@ def load_config():
         config[var] = os.getenv(var)
         if not config[var]:
             raise EnvironmentError(f"Missing required .env value: {var}")
-
     config["SQL_SERVER"] = os.getenv("SQL_SERVER")
     config["SQL_DATABASE"] = os.getenv("SQL_DATABASE")
     config["SQL_USERNAME"] = os.getenv("SQL_USERNAME")
@@ -48,7 +46,6 @@ def load_config():
     config["SQL_DRIVER"] = os.getenv("SQL_DRIVER", "ODBC Driver 17 for SQL Server")
     config["SQL_TABLE"] = os.getenv("SQL_TABLE", "akamai_events")
     config["OUTPUT_MODE"] = os.getenv("OUTPUT_MODE", "sql")
-
     return config
 
 def create_session(client_token, client_secret, access_token):
@@ -65,42 +62,33 @@ def fetch_events(session, host, config_id):
     limit = 20000
     events = []
     to_file = Path(".akamai_to")
-
     now = int(datetime.now(timezone.utc).timestamp())
     prev_to = int(to_file.read_text().strip()) if to_file.exists() else now - 1000
     from_time = prev_to
     to_time = now - 5
-
     logging.info(f"Fetching events from {from_time} to {to_time}")
     params = {"from": from_time, "to": to_time, "limit": limit}
-
     batch_number = 1
-
     while True:
-        response = session.get(url, params=params, timeout=60)
+        response = session.get(url, params=params, timeout=1800)
         if response.status_code != 200:
             logging.error(f"Error {response.status_code}: {response.text}")
             break
-
         lines = response.text.strip().splitlines()
         if not lines:
             logging.info("No data returned.")
             break
-
         num_events = len(lines) - 1
         logging.info(f"Batch {batch_number}: Retrieved {num_events} events")
         batch_number += 1
-
         if num_events == 0:
             break
-
         for line in lines[:-1]:
             try:
                 event = json.loads(line)
                 events.append(event)
             except json.JSONDecodeError:
                 continue
-
         try:
             offset_context = json.loads(lines[-1])
             if offset_context.get("total", 1) == 0:
@@ -112,7 +100,6 @@ def fetch_events(session, host, config_id):
         except json.JSONDecodeError:
             logging.error("Failed to parse offset context. Stopping.")
             break
-
     to_file.write_text(str(to_time+1))
     return events
 
@@ -135,47 +122,95 @@ def decode_and_split(value_string):
         logging.warning(f"Decode error: {e}")
     return decoded_values
 
-def batch_insert(cursor, sql, data, batch_size=10000, table_name=""):
+def reconnect(config, retry_wait=5, max_retries=5):
+    attempt = 0
+    while True:
+        try:
+            logging.warning("Attempting to reconnect to MSSQL...")
+            conn_str = (
+                f"DRIVER={{{config['SQL_DRIVER']}}};"
+                f"SERVER={config['SQL_SERVER']};"
+                f"DATABASE={config['SQL_DATABASE']};"
+                f"UID={config['SQL_USERNAME']};"
+                f"PWD={config['SQL_PASSWORD']};"
+                f"TrustServerCertificate=yes;Encrypt=yes;"
+            )
+            conn = pyodbc.connect(conn_str, timeout=30)
+            if hasattr(conn, "fast_executemany"):
+                conn.fast_executemany = True
+            cursor = conn.cursor()
+            return conn, cursor
+        except pyodbc.Error as e:
+            attempt += 1
+            if attempt > max_retries:
+                logging.error(f"Failed to reconnect after {max_retries} tries: {e}")
+                raise
+            logging.warning(f"Reconnect failed ({e}), retrying in {retry_wait}s...")
+            time.sleep(retry_wait)
+
+def batch_insert(cursor, sql, data, config=None, batch_size=10000, table_name=""):
     for i in range(0, len(data), batch_size):
         chunk = data[i:i+batch_size]
-        try:
-            cursor.executemany(sql, chunk)
-            cursor.connection.commit()
-        except pyodbc.IntegrityError as e:
-            if "duplicate key" in str(e).lower() or "primary key" in str(e).lower():
-                logging.error(f"Duplicate key error during insert into {table_name}: {e}")
-                # Fallback: insert rows one by one
-                for row in chunk:
+        retry = 0
+        duplicates = 0
+        while retry < 5:
+            try:
+                cursor.executemany(sql, chunk)
+                cursor.connection.commit()
+                break
+            except pyodbc.OperationalError as e:
+                if "08S01" in str(e) or "timeout" in str(e).lower():
+                    logging.warning(f"SQL connection lost or timed out ({e}); reconnecting and retrying...")
                     try:
-                        cursor.execute(sql, row)
-                        cursor.connection.commit()
-                    except pyodbc.IntegrityError as single_e:
-                        if "duplicate key" in str(single_e).lower() or "primary key" in str(single_e).lower():
-                            logging.warning(f"Skipped duplicate key in {table_name}: {row[0]}")
-                        else:
-                            logging.exception(f"Database error during per-row insert into {table_name}:")
-            else:
-                logging.exception(f"Database error during insert into {table_name}:")
-                continue
+                        cursor.connection.close()
+                    except Exception:
+                        pass
+                    _, cursor = reconnect(config)
+                    retry += 1
+                    continue
+                else:
+                    logging.exception(f"Operational error during insert into {table_name}:")
+                    raise
+            except pyodbc.IntegrityError as e:
+                # Fallback: Insert rows one by one; summarize duplicates per batch
+                for row in chunk:
+                    row_retries = 0
+                    while row_retries < 5:
+                        try:
+                            cursor.execute(sql, row)
+                            cursor.connection.commit()
+                            break
+                        except pyodbc.IntegrityError as single_e:
+                            if "duplicate key" in str(single_e).lower() or "primary key" in str(single_e).lower():
+                                duplicates += 1
+                                break
+                            elif "foreign key" in str(single_e).lower():
+                                break
+                            else:
+                                logging.exception(f"Database error during per-row insert into {table_name}:")
+                                raise
+                        except pyodbc.OperationalError as single_e:
+                            if "08S01" in str(single_e) or "timeout" in str(single_e).lower():
+                                logging.warning(f"SQL connection lost or timed out during per-row insert ({single_e}); reconnecting and retrying...")
+                                try:
+                                    cursor.connection.close()
+                                except Exception:
+                                    pass
+                                _, cursor = reconnect(config)
+                                row_retries += 1
+                                continue
+                            else:
+                                logging.exception(f"Operational error during per-row insert into {table_name}:")
+                                raise
+                        break
+                break
         label = f" for table '{table_name}'" if table_name else ""
         logging.info(f"Committed batch {i + len(chunk)} / {len(data)}{label}")
+        if duplicates > 0:
+            logging.info(f"Skipped {duplicates} duplicate key(s) in {table_name} in this batch.")
 
 def write_to_mssql(config, events):
-    conn_str = (
-        f"DRIVER={{{config['SQL_DRIVER']}}};"
-        f"SERVER={config['SQL_SERVER']};"
-        f"DATABASE={config['SQL_DATABASE']};"
-        f"UID={config['SQL_USERNAME']};"
-        f"PWD={config['SQL_PASSWORD']};"
-        f"TrustServerCertificate=yes;Encrypt=yes;"
-    )
-
-    conn = pyodbc.connect(conn_str)
-    if hasattr(conn, "fast_executemany"):
-        conn.fast_executemany = True
-
-    cursor = conn.cursor()
-
+    conn, cursor = reconnect(config)
     total = len(events)
     main_rows = []
     child_tables = {
@@ -187,7 +222,6 @@ def write_to_mssql(config, events):
         "akamai_attack_ruleVersions": [],
         "akamai_attack_rules": [],
     }
-
     child_columns = {
         "akamai_attack_ruleActions": "rule_action",
         "akamai_attack_ruleData": "rule_data",
@@ -197,7 +231,6 @@ def write_to_mssql(config, events):
         "akamai_attack_ruleVersions": "rule_version",
         "akamai_attack_rules": "rule_id",
     }
-
     seen_request_ids = set()
     for idx, event in enumerate(events, 1):
         ad = event.get("attackData", {})
@@ -207,11 +240,9 @@ def write_to_mssql(config, events):
         http = event.get("httpMessage", {})
         urd = event.get("userRiskData", {})
         request_id = http.get("requestId")
-
         if not request_id or request_id in seen_request_ids:
             continue
         seen_request_ids.add(request_id)
-
         main_rows.append((
             request_id, event.get("format"), event.get("type"), event.get("version"), event.get("responseSegment"),
             ad.get("apiId"), ad.get("apiKey"), ad.get("clientIP"),
@@ -227,7 +258,6 @@ def write_to_mssql(config, events):
             urd.get("risk"), urd.get("score"), urd.get("status"),
             urd.get("trust"), urd.get("username"), urd.get("uuid")
         ))
-
         for table, column, val in [
             ("akamai_attack_ruleActions", "rule_action", ad.get("ruleActions")),
             ("akamai_attack_ruleData", "rule_data", ad.get("ruleData")),
@@ -239,11 +269,9 @@ def write_to_mssql(config, events):
         ]:
             for v in decode_and_split(val):
                 child_tables[table].append((request_id, v))
-
         if idx % 1000 == 0 or idx == total:
             percent = (idx / total) * 100
             logging.info(f"Progress: {idx}/{total} ({percent:.1f}%)")
-
     main_sql = f"""
         INSERT INTO {config['SQL_TABLE']} (
             requestId, format, type, version, responseSegment,
@@ -263,16 +291,14 @@ def write_to_mssql(config, events):
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
     """
-    batch_insert(cursor, main_sql, main_rows, table_name=config['SQL_TABLE'])
-
+    batch_insert(cursor, main_sql, main_rows, config=config, table_name=config['SQL_TABLE'])
     for table, rows in child_tables.items():
         if rows:
             column = child_columns[table]
             sql = f"INSERT INTO {table} (requestId, {column}) VALUES (?, ?)"
-            batch_insert(cursor, sql, rows, table_name=table)
-
-    conn.commit()
-    conn.close()
+            batch_insert(cursor, sql, rows, config=config, table_name=table)
+    cursor.connection.commit()
+    cursor.connection.close()
     logging.info(f"Inserted {total} events and child records into MSSQL.")
 
 def group_events(events):
@@ -283,44 +309,36 @@ def group_events(events):
     by_method = defaultdict(int)
     by_tls_fingerprint = defaultdict(int)
     by_rule_action = defaultdict(int)
-
     for event in events:
         try:
             http = event.get("httpMessage", {})
             request_context = event.get("requestContext", {})
             attack_data = event.get("attackData", {})
             request_id = http.get("requestId")
-
             if not request_id or request_id in seen_request_ids:
                 continue
             seen_request_ids.add(request_id)
-
             hostname = http.get("host", "unknown")
             path = http.get("path", "unknown")
             method = http.get("method", "unknown")
             tls_fingerprint = request_context.get("clientTlsFingerprint", "unknown")
-
             by_hostname[hostname] += 1
             by_path[path] += 1
             by_method[method] += 1
             by_tls_fingerprint[tls_fingerprint] += 1
-
             raw_actions = attack_data.get("ruleActions", "")
             if raw_actions:
                 for action_decoded in decode_and_split(raw_actions):
                     if action_decoded:
                         by_rule_action[action_decoded] += 1
-
             raw_tags = attack_data.get("ruleTags", "")
             if raw_tags:
                 for tag_decoded in decode_and_split(raw_tags):
                     if tag_decoded:
                         by_category[tag_decoded] += 1
-
         except Exception as e:
             logging.warning(f"Error processing event for grouping: {e}")
             continue
-
     return {
         "by_hostname": by_hostname,
         "by_category": by_category,
@@ -335,21 +353,18 @@ def write_output(data, output_directory="output"):
     output_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = output_dir / f"akamai_output_{timestamp}.txt"
-
     with output_path.open("w", encoding='utf-8') as f:
         def write_section(title, counter):
             f.write(f"{title}:\n")
             for key, count in sorted(counter.items(), key=lambda x: (-x[1], x[0])):
                 f.write(f"{key}: {count}\n")
             f.write("\n")
-
         write_section("Requests by Hostname", data["by_hostname"])
         write_section("Requests by Category (Rule Tags)", data["by_category"])
         write_section("Requests by Path", data["by_path"])
         write_section("Requests by Method", data["by_method"])
         write_section("Requests by TLS Fingerprint", data["by_tls_fingerprint"])
         write_section("Requests by Rule Action", data["by_rule_action"])
-
     logging.info(f"Output written to {output_path}")
 
 def main():
@@ -364,9 +379,7 @@ def main():
     if not events:
         logging.info("No events retrieved.")
         return
-
     logging.info(f"Retrieved {len(events)} total events")
-
     if config["OUTPUT_MODE"].lower() == "sql":
         logging.info("Output mode: SQL. Writing data to MSSQL.")
         write_to_mssql(config, events)
@@ -377,7 +390,6 @@ def main():
     else:
         logging.error(f"Invalid OUTPUT_MODE '{config['OUTPUT_MODE']}'. Must be 'sql' or 'txt'.")
         sys.exit(1)
-
     sys.exit(0)
 
 if __name__ == "__main__":
