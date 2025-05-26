@@ -4,6 +4,7 @@ import json
 import urllib.parse
 import base64
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
@@ -18,13 +19,19 @@ def setup_logging():
     log_dir = Path(__file__).resolve().parent / "logs"
     log_dir.mkdir(exist_ok=True)
     log_file = log_dir / "akamai_fetch.log"
+    # Log rotation: 10 MB per file, keep up to 5 old logs
+    file_handler = RotatingFileHandler(
+        log_file,
+        mode='a',
+        maxBytes=10*1024*1024,
+        backupCount=5,
+        encoding='utf-8'
+    )
+    stream_handler = logging.StreamHandler()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(log_file, mode='a', encoding='utf-8'),
-            logging.StreamHandler()
-        ]
+        handlers=[file_handler, stream_handler]
     )
 
 def load_config():
