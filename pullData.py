@@ -4,14 +4,15 @@ import json
 import urllib.parse
 import base64
 import logging
-from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import pyodbc
+pyodbc.pooling = True   # Use ODBC connection pooling for best performance
 from akamai.edgegrid import EdgeGridAuth
 from dotenv import load_dotenv
 
@@ -19,19 +20,13 @@ def setup_logging():
     log_dir = Path(__file__).resolve().parent / "logs"
     log_dir.mkdir(exist_ok=True)
     log_file = log_dir / "akamai_fetch.log"
-    # Log rotation: 10 MB per file, keep up to 5 old logs
-    file_handler = RotatingFileHandler(
-        log_file,
-        mode='a',
-        maxBytes=10*1024*1024,
-        backupCount=5,
-        encoding='utf-8'
-    )
-    stream_handler = logging.StreamHandler()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[file_handler, stream_handler]
+        handlers=[
+            logging.FileHandler(log_file, mode='a', encoding='utf-8'),
+            logging.StreamHandler()
+        ]
     )
 
 def load_config():
@@ -53,6 +48,7 @@ def load_config():
     config["SQL_DRIVER"] = os.getenv("SQL_DRIVER", "ODBC Driver 17 for SQL Server")
     config["SQL_TABLE"] = os.getenv("SQL_TABLE", "akamai_events")
     config["OUTPUT_MODE"] = os.getenv("OUTPUT_MODE", "sql")
+    config["BATCH_SIZE"] = int(os.getenv("BATCH_SIZE", "10000"))
     return config
 
 def create_session(client_token, client_secret, access_token):
@@ -129,11 +125,32 @@ def decode_and_split(value_string):
         logging.warning(f"Decode error: {e}")
     return decoded_values
 
+def connect(config):
+    logging.info("Connecting to MSSQL...")
+    conn_str = (
+        f"DRIVER={{{config['SQL_DRIVER']}}};"
+        f"SERVER={config['SQL_SERVER']};"
+        f"DATABASE={config['SQL_DATABASE']};"
+        f"UID={config['SQL_USERNAME']};"
+        f"PWD={config['SQL_PASSWORD']};"
+        f"TrustServerCertificate=yes;Encrypt=yes;"
+    )
+    conn = pyodbc.connect(conn_str, timeout=60)
+    try:
+        conn.fast_executemany = True
+    except Exception:
+        pass  # Not all drivers support it
+    cursor = conn.cursor()
+    # Optionally validate:
+    cursor.execute("SELECT 1")
+    cursor.fetchall()
+    return conn, cursor
+
 def reconnect(config, retry_wait=5, max_retries=5):
     attempt = 0
     while True:
         try:
-            logging.warning("Attempting to reconnect to MSSQL...")
+            logging.warning("Attempting to reconnect to MSSQL after connection failure...")
             conn_str = (
                 f"DRIVER={{{config['SQL_DRIVER']}}};"
                 f"SERVER={config['SQL_SERVER']};"
@@ -142,19 +159,21 @@ def reconnect(config, retry_wait=5, max_retries=5):
                 f"PWD={config['SQL_PASSWORD']};"
                 f"TrustServerCertificate=yes;Encrypt=yes;"
             )
-            conn = pyodbc.connect(conn_str, timeout=30)
+            conn = pyodbc.connect(conn_str, timeout=60)
             try:
                 conn.fast_executemany = True
             except Exception:
-                pass  # Not all drivers support it
+                pass
             cursor = conn.cursor()
+            cursor.execute("SELECT 1")
+            cursor.fetchall()
             return conn, cursor
         except pyodbc.Error as e:
             attempt += 1
+            logging.warning(f"Reconnect failed with error: {repr(e)}")
             if attempt > max_retries:
                 logging.error(f"Failed to reconnect after {max_retries} tries: {e}")
                 raise
-            logging.warning(f"Reconnect failed ({e}), retrying in {retry_wait}s...")
             time.sleep(retry_wait)
 
 def batch_insert(cursor, sql, data, config=None, batch_size=10000, table_name=""):
@@ -169,6 +188,8 @@ def batch_insert(cursor, sql, data, config=None, batch_size=10000, table_name=""
                 cursor.connection.commit()
                 break
             except pyodbc.OperationalError as e:
+                logging.warning(f"pyodbc.OperationalError during insert: {repr(e)}")
+                logging.warning(f"Error args: {getattr(e, 'args', None)}")
                 if "08S01" in str(e) or "timeout" in str(e).lower():
                     logging.warning(f"SQL connection lost or timed out ({e}); reconnecting and retrying...")
                     try:
@@ -209,6 +230,7 @@ def batch_insert(cursor, sql, data, config=None, batch_size=10000, table_name=""
                                 logging.error(f"DataError: {data_e}. Row was: {row}")
                                 break
                         except pyodbc.OperationalError as single_e:
+                            logging.warning(f"pyodbc.OperationalError during per-row insert: {repr(single_e)}")
                             if "08S01" in str(single_e) or "timeout" in str(single_e).lower():
                                 logging.warning(f"SQL connection lost or timed out during per-row insert ({single_e}); reconnecting and retrying...")
                                 try:
@@ -230,8 +252,22 @@ def batch_insert(cursor, sql, data, config=None, batch_size=10000, table_name=""
         if truncation > 0:
             logging.warning(f"Skipped {truncation} row(s) in {table_name} due to string truncation in this batch.")
 
+def parallel_child_inserts(child_tables, config, child_columns):
+    def child_insert_worker(args):
+        table, rows = args
+        if not rows:
+            return
+        conn, cursor = connect(config)
+        column = child_columns[table]
+        sql = f"INSERT INTO {table} (requestId, {column}) VALUES (?, ?)"
+        batch_insert(cursor, sql, rows, config=config, table_name=table)
+        cursor.connection.commit()
+        cursor.connection.close()
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        executor.map(child_insert_worker, [(table, rows) for table, rows in child_tables.items() if rows])
+
 def write_to_mssql(config, events):
-    conn, cursor = reconnect(config)
+    conn, cursor = connect(config)
     total = len(events)
     main_rows = []
     child_tables = {
@@ -312,14 +348,11 @@ def write_to_mssql(config, events):
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
     """
-    batch_insert(cursor, main_sql, main_rows, config=config, table_name=config['SQL_TABLE'])
-    for table, rows in child_tables.items():
-        if rows:
-            column = child_columns[table]
-            sql = f"INSERT INTO {table} (requestId, {column}) VALUES (?, ?)"
-            batch_insert(cursor, sql, rows, config=config, table_name=table)
+    batch_insert(cursor, main_sql, main_rows, config=config, batch_size=config["BATCH_SIZE"], table_name=config['SQL_TABLE'])
     cursor.connection.commit()
     cursor.connection.close()
+    # Parallel child inserts here
+    parallel_child_inserts(child_tables, config, child_columns)
     logging.info(f"Inserted {total} events and child records into MSSQL.")
 
 def group_events(events):
