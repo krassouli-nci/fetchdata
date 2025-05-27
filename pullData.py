@@ -12,7 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import pyodbc
-pyodbc.pooling = True   # Use ODBC connection pooling for best performance
+pyodbc.pooling = True   # Enable ODBC connection pooling globally
+
 from akamai.edgegrid import EdgeGridAuth
 from dotenv import load_dotenv
 
@@ -140,34 +141,19 @@ def connect(config):
         conn.fast_executemany = True
     except Exception:
         pass  # Not all drivers support it
-    cursor = conn.cursor()
-    # Optionally validate:
-    cursor.execute("SELECT 1")
-    cursor.fetchall()
-    return conn, cursor
+    return conn
 
 def reconnect(config, retry_wait=5, max_retries=5):
     attempt = 0
     while True:
         try:
             logging.warning("Attempting to reconnect to MSSQL after connection failure...")
-            conn_str = (
-                f"DRIVER={{{config['SQL_DRIVER']}}};"
-                f"SERVER={config['SQL_SERVER']};"
-                f"DATABASE={config['SQL_DATABASE']};"
-                f"UID={config['SQL_USERNAME']};"
-                f"PWD={config['SQL_PASSWORD']};"
-                f"TrustServerCertificate=yes;Encrypt=yes;"
-            )
-            conn = pyodbc.connect(conn_str, timeout=60)
-            try:
-                conn.fast_executemany = True
-            except Exception:
-                pass
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1")
-            cursor.fetchall()
-            return conn, cursor
+            conn = connect(config)
+            # Test the connection
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                cursor.fetchall()
+            return conn
         except pyodbc.Error as e:
             attempt += 1
             logging.warning(f"Reconnect failed with error: {repr(e)}")
@@ -189,21 +175,21 @@ def batch_insert(cursor, sql, data, config=None, batch_size=10000, table_name=""
                 break
             except pyodbc.OperationalError as e:
                 logging.warning(f"pyodbc.OperationalError during insert: {repr(e)}")
-                logging.warning(f"Error args: {getattr(e, 'args', None)}")
                 if "08S01" in str(e) or "timeout" in str(e).lower():
                     logging.warning(f"SQL connection lost or timed out ({e}); reconnecting and retrying...")
                     try:
                         cursor.connection.close()
                     except Exception:
                         pass
-                    _, cursor = reconnect(config)
+                    # Only reconnect after a failure!
+                    new_conn = reconnect(config)
+                    cursor = new_conn.cursor()
                     retry += 1
                     continue
                 else:
                     logging.exception(f"Operational error during insert into {table_name}:")
                     raise
             except pyodbc.IntegrityError as e:
-                # Fallback: Insert rows one by one; summarize duplicates/truncation per batch
                 for row in chunk:
                     row_retries = 0
                     while row_retries < 5:
@@ -237,7 +223,8 @@ def batch_insert(cursor, sql, data, config=None, batch_size=10000, table_name=""
                                     cursor.connection.close()
                                 except Exception:
                                     pass
-                                _, cursor = reconnect(config)
+                                new_conn = reconnect(config)
+                                cursor = new_conn.cursor()
                                 row_retries += 1
                                 continue
                             else:
@@ -253,22 +240,23 @@ def batch_insert(cursor, sql, data, config=None, batch_size=10000, table_name=""
             logging.warning(f"Skipped {truncation} row(s) in {table_name} due to string truncation in this batch.")
 
 def parallel_child_inserts(child_tables, config, child_columns):
+    # Each thread uses a fresh connection from the pool.
     def child_insert_worker(args):
         table, rows = args
         if not rows:
             return
-        conn, cursor = connect(config)
-        column = child_columns[table]
-        sql = f"INSERT INTO {table} (requestId, {column}) VALUES (?, ?)"
-        batch_insert(cursor, sql, rows, config=config, table_name=table)
-        cursor.connection.commit()
-        cursor.connection.close()
+        conn = connect(config)
+        with conn:
+            with conn.cursor() as cursor:
+                column = child_columns[table]
+                sql = f"INSERT INTO {table} (requestId, {column}) VALUES (?, ?)"
+                batch_insert(cursor, sql, rows, config=config, table_name=table)
+        # Connection auto-closed here
+
     with ThreadPoolExecutor(max_workers=4) as executor:
         executor.map(child_insert_worker, [(table, rows) for table, rows in child_tables.items() if rows])
 
 def write_to_mssql(config, events):
-    conn, cursor = connect(config)
-    total = len(events)
     main_rows = []
     child_tables = {
         "akamai_attack_ruleActions": [],
@@ -289,6 +277,7 @@ def write_to_mssql(config, events):
         "akamai_attack_rules": "rule_id",
     }
     seen_request_ids = set()
+    total = len(events)
     for idx, event in enumerate(events, 1):
         ad = event.get("attackData", {})
         bot = event.get("botData", {})
@@ -348,10 +337,12 @@ def write_to_mssql(config, events):
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
     """
-    batch_insert(cursor, main_sql, main_rows, config=config, batch_size=config["BATCH_SIZE"], table_name=config['SQL_TABLE'])
-    cursor.connection.commit()
-    cursor.connection.close()
-    # Parallel child inserts here
+    # Use a single connection for the main insert, and close after done
+    conn = connect(config)
+    with conn:
+        with conn.cursor() as cursor:
+            batch_insert(cursor, main_sql, main_rows, config=config, batch_size=config["BATCH_SIZE"], table_name=config['SQL_TABLE'])
+    # Parallel child inserts (each thread will grab its own connection from the pool)
     parallel_child_inserts(child_tables, config, child_columns)
     logging.info(f"Inserted {total} events and child records into MSSQL.")
 
