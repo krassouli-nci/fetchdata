@@ -1,6 +1,4 @@
 -- 1. Drop child tables first
-DROP TABLE IF EXISTS akamai_httpMessage_responseHeaders;
-DROP TABLE IF EXISTS akamai_httpMessage_requestHeaders;
 DROP TABLE IF EXISTS akamai_attack_rules;
 DROP TABLE IF EXISTS akamai_attack_ruleVersions;
 DROP TABLE IF EXISTS akamai_attack_ruleTags;
