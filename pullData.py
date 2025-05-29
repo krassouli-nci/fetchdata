@@ -18,12 +18,12 @@ from akamai.edgegrid import EdgeGridAuth
 from dotenv import load_dotenv
 
 FIELD_SIZE_LIMITS = {
+    'unique_id': 200,  # new composite key
     'requestId': 100,
     'format': 50,
     'type': 50,
     'version': 50,
     'responseSegment': 50,
-
     'attackData_apiId': 255,
     'attackData_apiKey': 255,
     'attackData_clientIP': 50,
@@ -31,38 +31,32 @@ FIELD_SIZE_LIMITS = {
     'attackData_configId': 50,
     'attackData_policyId': 50,
     'attackData_slowPostAction': 50,
-    'attackData_slowPostRate': 50,      # Use string
-    'attackData_custom': 8000,
-
-    'botData_botScore': 50,             # Use string
-
+    'attackData_slowPostRate': 50,
+    'botData_botScore': 50,
     'clientData_appBundleId': 255,
     'clientData_appVersion': 50,
     'clientData_sdkVersion': 50,
     'clientData_telemetryType': 50,
-
-    'geo_asn': 50,                      # Use string
+    'geo_asn': 50,
     'geo_city': 100,
     'geo_continent': 50,
     'geo_country': 50,
     'geo_regionCode': 50,
-
-    'httpMessage_bytes': 50,            # Use string
+    'httpMessage_bytes': 50,
     'httpMessage_host': 255,
     'httpMessage_method': 20,
     'httpMessage_path': 2048,
-    'httpMessage_port': 50,             # Use string
+    'httpMessage_port': 50,
     'httpMessage_protocol': 50,
-    'httpMessage_query': 8000,
-    'httpMessage_start': 50,            # Use string
-    'httpMessage_status': 50,           # Use string
+    'httpMessage_query': None,  # <-- change here: NVARCHAR(MAX) so no limit enforced
+    'httpMessage_start': 50,
+    'httpMessage_status': 50,
     'httpMessage_tls': 100,
-
-    'userRiskData_allow': 10,           # Use string
+    'userRiskData_allow': 10,
     'userRiskData_general': 100,
     'userRiskData_originUserId': 255,
     'userRiskData_risk': 100,
-    'userRiskData_score': 50,           # Use string
+    'userRiskData_score': 50,
     'userRiskData_status': 100,
     'userRiskData_trust': 100,
     'userRiskData_username': 255,
@@ -153,7 +147,7 @@ def fetch_events(session, host, config_id, limit=20000):
     from_time = prev_to
     to_time = now - 5
     logging.info(f"Fetching events from {from_time} to {to_time}")
-    params = {"from": "1747978284", "to": "1748978404", "limit": limit}
+    params = {"from": from_time, "to": to_time, "limit": limit}
     batch_number = 1
     while True:
         response = session.get(url, params=params, timeout=1800)
@@ -218,28 +212,47 @@ def decode_and_split(value_string):
 
 def connect(config):
     logging.info("Connecting to MSSQL...")
-    conn_str = (
-        f"DRIVER={{{config['SQL_DRIVER']}}};"
-        f"SERVER={config['SQL_SERVER']};"
-        f"DATABASE={config['SQL_DATABASE']};"
-        f"UID={config['SQL_USERNAME']};"
-        f"PWD={config['SQL_PASSWORD']};"
-        f"TrustServerCertificate=yes;Encrypt=yes;packet size=32767;"
-    )
+    trusted = os.getenv("SQL_TRUSTED_CONNECTION", "false").lower() == "true"
+    if trusted:
+        conn_str = (
+            f"DRIVER={{{config['SQL_DRIVER']}}};"
+            f"SERVER={config['SQL_SERVER']};"
+            f"DATABASE={config['SQL_DATABASE']};"
+            f"Trusted_Connection=yes;"
+            f"TrustServerCertificate=yes;Encrypt=yes;packet size=32767;"
+        )
+    else:
+        conn_str = (
+            f"DRIVER={{{config['SQL_DRIVER']}}};"
+            f"SERVER={config['SQL_SERVER']};"
+            f"DATABASE={config['SQL_DATABASE']};"
+            f"UID={config['SQL_USERNAME']};"
+            f"PWD={config['SQL_PASSWORD']};"
+            f"TrustServerCertificate=yes;Encrypt=yes;packet size=32767;"
+        )
     conn = pyodbc.connect(conn_str, timeout=60)
     conn.autocommit = False
     return conn
 
-def deduplicate_by_request_id(rows, key_index=0):
+def deduplicate_by_unique_id(rows, key_index=0):
     seen = set()
     deduped = []
     for row in rows:
-        req_id = row[key_index]
-        if req_id not in seen:
+        uid = row[key_index]
+        if uid not in seen:
             deduped.append(row)
-            seen.add(req_id)
+            seen.add(uid)
     return deduped
 
+def deduplicate_child_rows(rows):
+    seen = set()
+    deduped = []
+    for row in rows:
+        key = (row[0], row[1])
+        if key not in seen:
+            deduped.append(row)
+            seen.add(key)
+    return deduped
 
 def batch_insert(
     cursor,
@@ -250,31 +263,17 @@ def batch_insert(
     table_name="akamai_events",
     field_names=None
 ):
-    """
-    Insert data in batches using executemany, letting SQL Server skip duplicates.
-    - cursor: pyodbc cursor (must be open)
-    - sql: str, parameterized insert statement
-    - data: list of tuples
-    - config: optional, for logging/context
-    - batch_size: int, how many rows per batch
-    - table_name: str, for logging
-    - field_names: list of field names (for optional row length validation)
-    """
-
     conn = cursor.connection
     total = len(data)
     total_inserted = 0
-
     for i in range(0, total, batch_size):
         chunk = data[i:i+batch_size]
-        # Optional: Validate row length
         expected_length = len(field_names) if field_names else None
         for rownum, row in enumerate(chunk):
             row_length = len(row) if isinstance(row, (tuple, list)) else len(field_names)
             if expected_length is not None and row_length != expected_length:
                 logging.error(f"[VALIDATION ERROR] Row {rownum} length {row_length} does not match expected {expected_length}: {row}")
                 raise Exception(f"Row {rownum} length {row_length} does not match expected {expected_length}: {row}")
-
         retry = 0
         while retry < 5:
             try:
@@ -286,9 +285,8 @@ def batch_insert(
                 cursor.executemany(sql, chunk)
                 conn.commit()
                 total_inserted += len(chunk)
-                break  # Done with this chunk
+                break
             except pyodbc.IntegrityError as e:
-                # Log and skip duplicate primary key errors, otherwise re-raise
                 if 'PRIMARY KEY' in str(e) or 'duplicate' in str(e).lower():
                     logging.warning(f"Duplicate key error in chunk (some or all rows already exist) for {table_name}: {e}")
                     conn.rollback()
@@ -304,35 +302,17 @@ def batch_insert(
                 retry += 1
                 time.sleep(2)
         logging.info(f"Committed batch {min(i+len(chunk), total)} / {total} for table '{table_name}'")
-
     logging.info(f"Batch insert finished for {table_name}. {total_inserted} rows attempted (duplicates skipped by SQL Server).")
-def deduplicate_child_rows(rows):
-    """
-    Deduplicate (requestId, value) pairs for child table inserts.
-    Accepts a list of tuples: (requestId, value)
-    Returns a new list with duplicates removed.
-    """
-    seen = set()
-    deduped = []
-    for row in rows:
-        key = (row[0], row[1])  # (requestId, value)
-        if key not in seen:
-            deduped.append(row)
-            seen.add(key)
-    return deduped
 
-
-def parallel_child_inserts(child_tables, config, child_columns, allowed_request_ids=None):
+def parallel_child_inserts(child_tables, config, child_columns, allowed_unique_ids=None):
     def child_insert_worker(args):
         table, rows = args
         if not rows:
             return
-        # Only allow rows with allowed_request_ids (FK safe)
-        if allowed_request_ids is not None:
-            rows = [row for row in rows if row[0] in allowed_request_ids]
+        if allowed_unique_ids is not None:
+            rows = [row for row in rows if row[0] in allowed_unique_ids]
         if not rows:
             return
-        # Deduplicate here!
         rows = deduplicate_child_rows(rows)
         conn = connect(config)
         try:
@@ -345,12 +325,11 @@ def parallel_child_inserts(child_tables, config, child_columns, allowed_request_
             column = child_columns[table]
             validated_rows = []
             for row in rows:
-                request_id, val = row
+                unique_id, val = row
                 validated_val = truncate_value(val, column, CHILD_FIELD_LIMITS[column])
-                validated_rows.append((truncate_value(request_id, 'requestId', FIELD_SIZE_LIMITS['requestId']), validated_val))
-            # No need to deduplicate again here, it's already done
-            sql = f"INSERT INTO {table} (requestId, {column}) VALUES (?, ?)"
-            batch_insert(cursor, sql, validated_rows, config=config, table_name=table, field_names=['requestId', column])
+                validated_rows.append((truncate_value(unique_id, 'unique_id', FIELD_SIZE_LIMITS['unique_id']), validated_val))
+            sql = f"INSERT INTO {table} (unique_id, {column}) VALUES (?, ?)"
+            batch_insert(cursor, sql, validated_rows, config=config, table_name=table, field_names=['unique_id', column])
         finally:
             try:
                 conn.close()
@@ -373,13 +352,13 @@ def write_to_mssql(config, events):
         "akamai_attack_ruleTags": "rule_tag",
         "akamai_attack_rules": "rule_id",
     }
-    seen_request_ids = set()
+    seen_unique_ids = set()
     total = len(events)
     main_row_fields = [
-        'requestId', 'format', 'type', 'version', 'responseSegment',
+        'unique_id', 'requestId', 'format', 'type', 'version', 'responseSegment',
         'attackData_apiId', 'attackData_apiKey', 'attackData_clientIP',
         'attackData_clientReputation', 'attackData_configId', 'attackData_policyId',
-        'attackData_slowPostAction', 'attackData_slowPostRate', 'attackData_custom',
+        'attackData_slowPostAction', 'attackData_slowPostRate',
         'botData_botScore',
         'clientData_appBundleId', 'clientData_appVersion', 'clientData_sdkVersion', 'clientData_telemetryType',
         'geo_asn', 'geo_city', 'geo_continent', 'geo_country', 'geo_regionCode',
@@ -390,8 +369,7 @@ def write_to_mssql(config, events):
         'userRiskData_risk', 'userRiskData_score', 'userRiskData_status',
         'userRiskData_trust', 'userRiskData_username', 'userRiskData_uuid'
     ]
-    # --- Build main and child row lists
-    row_request_ids = []  # keep list of main requestIds as you go
+    row_unique_ids = []
     child_table_raw_rows = {k: [] for k in child_tables}
     for idx, event in enumerate(events, 1):
         ad = event.get("attackData", {})
@@ -401,11 +379,14 @@ def write_to_mssql(config, events):
         http = event.get("httpMessage", {})
         urd = event.get("userRiskData", {})
         request_id = http.get("requestId")
-        if not request_id or request_id in seen_request_ids:
+        start = http.get("start")
+        unique_id = f"{request_id}_{start}" if request_id and start else None
+        if not unique_id or unique_id in seen_unique_ids:
             continue
-        seen_request_ids.add(request_id)
-        row_request_ids.append(request_id)
+        seen_unique_ids.add(unique_id)
+        row_unique_ids.append(unique_id)
         row_dict = {
+            'unique_id': unique_id,
             'requestId': request_id,
             'format': event.get("format"),
             'type': event.get("type"),
@@ -419,7 +400,6 @@ def write_to_mssql(config, events):
             'attackData_policyId': ad.get("policyId"),
             'attackData_slowPostAction': ad.get("slowPostAction"),
             'attackData_slowPostRate': ad.get("slowPostRate"),
-            'attackData_custom': ad.get("custom"),
             'botData_botScore': bot.get("botScore"),
             'clientData_appBundleId': cd.get("appBundleId"),
             'clientData_appVersion': cd.get("appVersion"),
@@ -452,8 +432,8 @@ def write_to_mssql(config, events):
         }
         validated_row = []
         for fname in main_row_fields:
-            val = row_dict[fname]
-            maxlen = FIELD_SIZE_LIMITS.get(fname)
+            val = row_dict.get(fname)
+            maxlen = FIELD_SIZE_LIMITS.get(fname) if fname in FIELD_SIZE_LIMITS else None
             validated_row.append(truncate_value(val, fname, maxlen))
         main_rows.append(tuple(validated_row))
         for table, column, val in [
@@ -467,17 +447,15 @@ def write_to_mssql(config, events):
             for v in decode_and_split(val):
                 v_trunc = truncate_value(v, column, CHILD_FIELD_LIMITS[column])
                 child_table_raw_rows[table].append(
-                    (truncate_value(request_id, 'requestId', FIELD_SIZE_LIMITS['requestId']), v_trunc)
+                    (unique_id, v_trunc)
                 )
         if idx % 1000 == 0 or idx == total:
             percent = (idx / total) * 100
             logging.info(f"Progress: {idx}/{total} ({percent:.1f}%)")
-    # --- Deduplicate and insert main rows
-    deduped_rows = deduplicate_by_request_id(main_rows, key_index=0)
-    # Only requestIds that will actually be inserted/attempted
-    main_insert_request_ids = set(row[0] for row in deduped_rows)
+    deduped_rows = deduplicate_by_unique_id(main_rows, key_index=0)
+    main_insert_unique_ids = set(row[0] for row in deduped_rows)
     if len(deduped_rows) < len(main_rows):
-        logging.warning(f"Deduplicated {len(main_rows) - len(deduped_rows)} duplicate requestIds before insert.")
+        logging.warning(f"Deduplicated {len(main_rows) - len(deduped_rows)} duplicate unique_ids before insert.")
     conn = connect(config)
     try:
         cursor = conn.cursor()
@@ -488,10 +466,10 @@ def write_to_mssql(config, events):
             logging.info("fast_executemany not available (main table); using standard executemany.")
         main_sql = f"""
             INSERT INTO {config['SQL_TABLE']} (
-                requestId, format, type, version, responseSegment,
+                unique_id, requestId, format, type, version, responseSegment,
                 attackData_apiId, attackData_apiKey, attackData_clientIP,
                 attackData_clientReputation, attackData_configId, attackData_policyId,
-                attackData_slowPostAction, attackData_slowPostRate, attackData_custom,
+                attackData_slowPostAction, attackData_slowPostRate,
                 botData_botScore,
                 clientData_appBundleId, clientData_appVersion, clientData_sdkVersion, clientData_telemetryType,
                 geo_asn, geo_city, geo_continent, geo_country, geo_regionCode,
@@ -513,10 +491,9 @@ def write_to_mssql(config, events):
             conn.close()
         except Exception:
             pass
-    # --- Only include child rows for parent rows that were in main_insert_request_ids
     for table in child_tables:
-        child_tables[table] = [row for row in child_table_raw_rows[table] if row[0] in main_insert_request_ids]
-    parallel_child_inserts(child_tables, config, child_columns, allowed_request_ids=main_insert_request_ids)
+        child_tables[table] = [row for row in child_table_raw_rows[table] if row[0] in main_insert_unique_ids]
+    parallel_child_inserts(child_tables, config, child_columns, allowed_unique_ids=main_insert_unique_ids)
     logging.info(f"Inserted {total} events and child records into MSSQL.")
 
 def main():

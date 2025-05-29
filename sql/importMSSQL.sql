@@ -10,14 +10,14 @@ DROP TABLE IF EXISTS akamai_attack_ruleActions;
 -- 2. Drop main table
 DROP TABLE IF EXISTS akamai_events;
 
--- 3. Create main table with requestId as PRIMARY KEY
+-- 3. Create main table with unique_id as PRIMARY KEY, requestId as regular field
 CREATE TABLE akamai_events (
-    requestId VARCHAR(100) PRIMARY KEY,
+    unique_id NVARCHAR(200) PRIMARY KEY, -- Composite key
+    requestId VARCHAR(100),
     format NVARCHAR(50),
     type NVARCHAR(50),
     version NVARCHAR(50),
     responseSegment NVARCHAR(50),
-
     attackData_apiId NVARCHAR(255),
     attackData_apiKey NVARCHAR(255),
     attackData_clientIP NVARCHAR(50),
@@ -26,21 +26,16 @@ CREATE TABLE akamai_events (
     attackData_policyId NVARCHAR(50),
     attackData_slowPostAction NVARCHAR(50),
     attackData_slowPostRate NVARCHAR(50),
-    attackData_custom NVARCHAR(MAX),
-
     botData_botScore NVARCHAR(50),
-
     clientData_appBundleId NVARCHAR(255),
     clientData_appVersion NVARCHAR(50),
     clientData_sdkVersion NVARCHAR(50),
     clientData_telemetryType NVARCHAR(50),
-
     geo_asn NVARCHAR(50),
     geo_city NVARCHAR(100),
     geo_continent NVARCHAR(50),
     geo_country NVARCHAR(50),
     geo_regionCode NVARCHAR(50),
-
     httpMessage_bytes NVARCHAR(50),
     httpMessage_host NVARCHAR(255),
     httpMessage_method NVARCHAR(20),
@@ -51,7 +46,6 @@ CREATE TABLE akamai_events (
     httpMessage_start NVARCHAR(50),
     httpMessage_status NVARCHAR(50),
     httpMessage_tls NVARCHAR(100),
-
     userRiskData_allow NVARCHAR(10),
     userRiskData_general NVARCHAR(100),
     userRiskData_originUserId NVARCHAR(255),
@@ -61,48 +55,38 @@ CREATE TABLE akamai_events (
     userRiskData_trust NVARCHAR(100),
     userRiskData_username NVARCHAR(255),
     userRiskData_uuid NVARCHAR(255),
-
     created_at DATETIME2 DEFAULT SYSUTCDATETIME(),
     modified_at DATETIME2 DEFAULT SYSUTCDATETIME()
 );
 
--- 4. Child tables with surrogate key and unique nonclustered index
-
+-- 4. Child tables now use unique_id as FK (matches code), NOT requestId
 CREATE TABLE akamai_attack_ruleActions (
-    id INT IDENTITY(1,1) PRIMARY KEY,
-    requestId VARCHAR(100) NOT NULL,
+    unique_id NVARCHAR(200) NOT NULL,
     rule_action NVARCHAR(4000) NULL,
-    CONSTRAINT FK_akamai_attack_ruleActions_requestId FOREIGN KEY (requestId) REFERENCES akamai_events(requestId),
-    CONSTRAINT UQ_akamai_attack_ruleActions UNIQUE NONCLUSTERED (requestId, rule_action)
+    FOREIGN KEY (unique_id) REFERENCES akamai_events(unique_id)
 );
 
 CREATE TABLE akamai_attack_ruleSelectors (
-    id INT IDENTITY(1,1) PRIMARY KEY,
-    requestId VARCHAR(100) NOT NULL,
+    unique_id NVARCHAR(200) NOT NULL,
     rule_selector NVARCHAR(4000) NULL,
-    CONSTRAINT FK_akamai_attack_ruleSelectors_requestId FOREIGN KEY (requestId) REFERENCES akamai_events(requestId),
-    CONSTRAINT UQ_akamai_attack_ruleSelectors UNIQUE NONCLUSTERED (requestId, rule_selector)
+    FOREIGN KEY (unique_id) REFERENCES akamai_events(unique_id)
 );
 
 CREATE TABLE akamai_attack_ruleTags (
-    id INT IDENTITY(1,1) PRIMARY KEY,
-    requestId VARCHAR(100) NOT NULL,
+    unique_id NVARCHAR(200) NOT NULL,
     rule_tag NVARCHAR(4000) NULL,
-    CONSTRAINT FK_akamai_attack_ruleTags_requestId FOREIGN KEY (requestId) REFERENCES akamai_events(requestId),
-    CONSTRAINT UQ_akamai_attack_ruleTags UNIQUE NONCLUSTERED (requestId, rule_tag)
+    FOREIGN KEY (unique_id) REFERENCES akamai_events(unique_id)
 );
 
 CREATE TABLE akamai_attack_rules (
-    id INT IDENTITY(1,1) PRIMARY KEY,
-    requestId VARCHAR(100) NOT NULL,
+    unique_id NVARCHAR(200) NOT NULL,
     rule_id NVARCHAR(4000) NULL,
-    CONSTRAINT FK_akamai_attack_rules_requestId FOREIGN KEY (requestId) REFERENCES akamai_events(requestId),
-    CONSTRAINT UQ_akamai_attack_rules UNIQUE NONCLUSTERED (requestId, rule_id)
+    FOREIGN KEY (unique_id) REFERENCES akamai_events(unique_id)
 );
 
--- Add back any other child tables you need, following this same pattern.
-
 -- 5. Trigger to update modified_at timestamp
+DROP TRIGGER IF EXISTS trg_UpdateModifiedAt ON akamai_events;
+GO
 CREATE TRIGGER trg_UpdateModifiedAt
 ON akamai_events
 AFTER UPDATE
@@ -112,5 +96,6 @@ BEGIN
     UPDATE akamai_events
     SET modified_at = SYSUTCDATETIME()
     FROM akamai_events ae
-    INNER JOIN inserted i ON ae.requestId = i.requestId;
+    INNER JOIN inserted i ON ae.unique_id = i.unique_id;
 END;
+GO
