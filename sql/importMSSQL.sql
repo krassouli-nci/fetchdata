@@ -1,4 +1,4 @@
--- 1. Drop child tables first
+-- 1. Drop child tables first (order matters for FK constraints)
 DROP TABLE IF EXISTS akamai_attack_rules;
 DROP TABLE IF EXISTS akamai_attack_ruleVersions;
 DROP TABLE IF EXISTS akamai_attack_ruleTags;
@@ -11,7 +11,6 @@ DROP TABLE IF EXISTS akamai_attack_ruleActions;
 DROP TABLE IF EXISTS akamai_events;
 
 -- 3. Create main table with requestId as PRIMARY KEY
-
 CREATE TABLE akamai_events (
     requestId VARCHAR(100) PRIMARY KEY,
     format NVARCHAR(50),
@@ -26,38 +25,38 @@ CREATE TABLE akamai_events (
     attackData_configId NVARCHAR(50),
     attackData_policyId NVARCHAR(50),
     attackData_slowPostAction NVARCHAR(50),
-    attackData_slowPostRate FLOAT,
+    attackData_slowPostRate NVARCHAR(50),
     attackData_custom NVARCHAR(MAX),
 
-    botData_botScore INT,
+    botData_botScore NVARCHAR(50),
 
     clientData_appBundleId NVARCHAR(255),
     clientData_appVersion NVARCHAR(50),
     clientData_sdkVersion NVARCHAR(50),
     clientData_telemetryType NVARCHAR(50),
 
-    geo_asn INT,
+    geo_asn NVARCHAR(50),
     geo_city NVARCHAR(100),
     geo_continent NVARCHAR(50),
     geo_country NVARCHAR(50),
     geo_regionCode NVARCHAR(50),
 
-    httpMessage_bytes BIGINT,
+    httpMessage_bytes NVARCHAR(50),
     httpMessage_host NVARCHAR(255),
     httpMessage_method NVARCHAR(20),
     httpMessage_path NVARCHAR(2048),
-    httpMessage_port INT,
+    httpMessage_port NVARCHAR(50),
     httpMessage_protocol NVARCHAR(50),
     httpMessage_query NVARCHAR(MAX),
-    httpMessage_start BIGINT,
-    httpMessage_status INT,
+    httpMessage_start NVARCHAR(50),
+    httpMessage_status NVARCHAR(50),
     httpMessage_tls NVARCHAR(100),
 
-    userRiskData_allow BIT,
+    userRiskData_allow NVARCHAR(10),
     userRiskData_general NVARCHAR(100),
     userRiskData_originUserId NVARCHAR(255),
     userRiskData_risk NVARCHAR(100),
-    userRiskData_score INT,
+    userRiskData_score NVARCHAR(50),
     userRiskData_status NVARCHAR(100),
     userRiskData_trust NVARCHAR(100),
     userRiskData_username NVARCHAR(255),
@@ -67,49 +66,43 @@ CREATE TABLE akamai_events (
     modified_at DATETIME2 DEFAULT SYSUTCDATETIME()
 );
 
--- 4. Child tables using requestId as FK
+-- 4. Child tables with surrogate key and unique nonclustered index
+
 CREATE TABLE akamai_attack_ruleActions (
+    id INT IDENTITY(1,1) PRIMARY KEY,
     requestId VARCHAR(100) NOT NULL,
-    rule_action VARCHAR(4000) NULL,
-    FOREIGN KEY (requestId) REFERENCES akamai_events(requestId)
-);
-
-CREATE TABLE akamai_attack_ruleData (
-    requestId VARCHAR(100) NOT NULL,
-    rule_data VARCHAR(4000) NULL,
-    FOREIGN KEY (requestId) REFERENCES akamai_events(requestId)
-);
-
-CREATE TABLE akamai_attack_ruleMessages (
-    requestId VARCHAR(100) NOT NULL,
-    rule_message VARCHAR(4000) NULL,
-    FOREIGN KEY (requestId) REFERENCES akamai_events(requestId)
+    rule_action NVARCHAR(4000) NULL,
+    CONSTRAINT FK_akamai_attack_ruleActions_requestId FOREIGN KEY (requestId) REFERENCES akamai_events(requestId),
+    CONSTRAINT UQ_akamai_attack_ruleActions UNIQUE NONCLUSTERED (requestId, rule_action)
 );
 
 CREATE TABLE akamai_attack_ruleSelectors (
+    id INT IDENTITY(1,1) PRIMARY KEY,
     requestId VARCHAR(100) NOT NULL,
-    rule_selector VARCHAR(4000) NULL,
-    FOREIGN KEY (requestId) REFERENCES akamai_events(requestId)
+    rule_selector NVARCHAR(4000) NULL,
+    CONSTRAINT FK_akamai_attack_ruleSelectors_requestId FOREIGN KEY (requestId) REFERENCES akamai_events(requestId),
+    CONSTRAINT UQ_akamai_attack_ruleSelectors UNIQUE NONCLUSTERED (requestId, rule_selector)
 );
 
 CREATE TABLE akamai_attack_ruleTags (
+    id INT IDENTITY(1,1) PRIMARY KEY,
     requestId VARCHAR(100) NOT NULL,
-    rule_tag VARCHAR(4000) NULL,
-    FOREIGN KEY (requestId) REFERENCES akamai_events(requestId)
-);
-
-CREATE TABLE akamai_attack_ruleVersions (
-    requestId VARCHAR(100) NOT NULL,
-    rule_version VARCHAR(4000) NULL,
-    FOREIGN KEY (requestId) REFERENCES akamai_events(requestId)
+    rule_tag NVARCHAR(4000) NULL,
+    CONSTRAINT FK_akamai_attack_ruleTags_requestId FOREIGN KEY (requestId) REFERENCES akamai_events(requestId),
+    CONSTRAINT UQ_akamai_attack_ruleTags UNIQUE NONCLUSTERED (requestId, rule_tag)
 );
 
 CREATE TABLE akamai_attack_rules (
+    id INT IDENTITY(1,1) PRIMARY KEY,
     requestId VARCHAR(100) NOT NULL,
-    rule_id VARCHAR(4000) NULL,
-    FOREIGN KEY (requestId) REFERENCES akamai_events(requestId)
+    rule_id NVARCHAR(4000) NULL,
+    CONSTRAINT FK_akamai_attack_rules_requestId FOREIGN KEY (requestId) REFERENCES akamai_events(requestId),
+    CONSTRAINT UQ_akamai_attack_rules UNIQUE NONCLUSTERED (requestId, rule_id)
 );
 
+-- Add back any other child tables you need, following this same pattern.
+
+-- 5. Trigger to update modified_at timestamp
 CREATE TRIGGER trg_UpdateModifiedAt
 ON akamai_events
 AFTER UPDATE

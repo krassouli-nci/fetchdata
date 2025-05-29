@@ -23,6 +23,7 @@ FIELD_SIZE_LIMITS = {
     'type': 50,
     'version': 50,
     'responseSegment': 50,
+
     'attackData_apiId': 255,
     'attackData_apiKey': 255,
     'attackData_clientIP': 50,
@@ -30,32 +31,38 @@ FIELD_SIZE_LIMITS = {
     'attackData_configId': 50,
     'attackData_policyId': 50,
     'attackData_slowPostAction': 50,
-    'attackData_custom': None,
-    'botData_botScore': None,
+    'attackData_slowPostRate': 50,      # Use string
+    'attackData_custom': 8000,
+
+    'botData_botScore': 50,             # Use string
+
     'clientData_appBundleId': 255,
     'clientData_appVersion': 50,
     'clientData_sdkVersion': 50,
     'clientData_telemetryType': 50,
-    'geo_asn': None,
+
+    'geo_asn': 50,                      # Use string
     'geo_city': 100,
     'geo_continent': 50,
     'geo_country': 50,
     'geo_regionCode': 50,
-    'httpMessage_bytes': None,
+
+    'httpMessage_bytes': 50,            # Use string
     'httpMessage_host': 255,
     'httpMessage_method': 20,
     'httpMessage_path': 2048,
-    'httpMessage_port': None,
+    'httpMessage_port': 50,             # Use string
     'httpMessage_protocol': 50,
-    'httpMessage_query': None,
-    'httpMessage_start': None,
-    'httpMessage_status': None,
+    'httpMessage_query': 8000,
+    'httpMessage_start': 50,            # Use string
+    'httpMessage_status': 50,           # Use string
     'httpMessage_tls': 100,
-    'userRiskData_allow': None,
+
+    'userRiskData_allow': 10,           # Use string
     'userRiskData_general': 100,
     'userRiskData_originUserId': 255,
     'userRiskData_risk': 100,
-    'userRiskData_score': None,
+    'userRiskData_score': 50,           # Use string
     'userRiskData_status': 100,
     'userRiskData_trust': 100,
     'userRiskData_username': 255,
@@ -72,26 +79,21 @@ CHILD_FIELD_LIMITS = {
     'rule_id': 4000,
 }
 
+def force_string(val):
+    if val is None:
+        return None
+    s = str(val)
+    if s.strip() == "":
+        return None
+    return s
+
 def truncate_value(value, field_name, max_length):
+    value = force_string(value)
     if value is None:
         return None
-    if isinstance(value, str):
-        if value.strip() == "":
-            return None
-    if max_length is not None:
-        if isinstance(value, bytes):
-            try:
-                value = value.decode('utf-8', errors='replace')
-            except Exception:
-                value = str(value)
-        if isinstance(value, (list, dict)):
-            logging.warning(f"Field '{field_name}' received a {type(value).__name__}; converting to string: {value!r}")
-            value = str(value)
-        if not isinstance(value, (str, int, float, bool)):
-            value = str(value)
-        if isinstance(value, str) and len(value) > max_length:
-            logging.warning(f"Value for '{field_name}' truncated to {max_length} chars. Original: {value[:200]!r}...")
-            return value[:max_length]
+    if max_length is not None and len(value) > max_length:
+        logging.warning(f"Value for '{field_name}' truncated to {max_length} chars. Original: {value[:200]!r}...")
+        return value[:max_length]
     return value
 
 def setup_logging():
@@ -123,7 +125,7 @@ def load_config():
     config["SQL_DATABASE"] = os.getenv("SQL_DATABASE")
     config["SQL_USERNAME"] = os.getenv("SQL_USERNAME")
     config["SQL_PASSWORD"] = os.getenv("SQL_PASSWORD")
-    config["SQL_DRIVER"] = os.getenv("SQL_DRIVER", "ODBC Driver 17 for SQL Server")
+    config["SQL_DRIVER"] = os.getenv("SQL_DRIVER", "ODBC Driver 18 for SQL Server")
     config["SQL_TABLE"] = os.getenv("SQL_TABLE", "akamai_events")
     config["OUTPUT_MODE"] = os.getenv("OUTPUT_MODE", "sql")
     config["BATCH_SIZE"] = int(os.getenv("BATCH_SIZE", "10000"))
@@ -151,7 +153,7 @@ def fetch_events(session, host, config_id, limit=20000):
     from_time = prev_to
     to_time = now - 5
     logging.info(f"Fetching events from {from_time} to {to_time}")
-    params = {"from": from_time, "to": to_time, "limit": limit}
+    params = {"from": "1747978284", "to": "1748978404", "limit": limit}
     batch_number = 1
     while True:
         response = session.get(url, params=params, timeout=1800)
@@ -228,30 +230,6 @@ def connect(config):
     conn.autocommit = False
     return conn
 
-def reconnect(config, retry_wait=5, max_retries=5):
-    attempt = 0
-    while True:
-        try:
-            logging.warning("Attempting to reconnect to MSSQL after connection failure...")
-            conn = connect(config)
-            cursor = conn.cursor()
-            try:
-                cursor.fast_executemany = True
-                logging.info("fast_executemany enabled for this platform/driver.")
-            except Exception:
-                logging.info("fast_executemany not available; using standard executemany.")
-            cursor.execute("SELECT 1")
-            cursor.fetchall()
-            cursor.close()
-            return conn
-        except pyodbc.Error as e:
-            attempt += 1
-            logging.warning(f"Reconnect failed with error: {repr(e)}")
-            if attempt > max_retries:
-                logging.error(f"Failed to reconnect after {max_retries} tries: {e}")
-                raise
-            time.sleep(retry_wait)
-
 def deduplicate_by_request_id(rows, key_index=0):
     seen = set()
     deduped = []
@@ -262,142 +240,100 @@ def deduplicate_by_request_id(rows, key_index=0):
             seen.add(req_id)
     return deduped
 
-def batch_insert(cursor, sql, data, config=None, batch_size=5000, table_name="", field_names=None):
-    conn = cursor.connection
-    for i in range(0, len(data), batch_size):
-        chunk = data[i:i+batch_size]
-        expected_length = len(field_names) if field_names else None
 
-        # BEGIN DATA VALIDATION AND LOGGING
+def batch_insert(
+    cursor,
+    sql,
+    data,
+    config=None,
+    batch_size=5000,
+    table_name="akamai_events",
+    field_names=None
+):
+    """
+    Insert data in batches using executemany, letting SQL Server skip duplicates.
+    - cursor: pyodbc cursor (must be open)
+    - sql: str, parameterized insert statement
+    - data: list of tuples
+    - config: optional, for logging/context
+    - batch_size: int, how many rows per batch
+    - table_name: str, for logging
+    - field_names: list of field names (for optional row length validation)
+    """
+
+    conn = cursor.connection
+    total = len(data)
+    total_inserted = 0
+
+    for i in range(0, total, batch_size):
+        chunk = data[i:i+batch_size]
+        # Optional: Validate row length
+        expected_length = len(field_names) if field_names else None
         for rownum, row in enumerate(chunk):
-            if rownum < 5 or rownum == len(chunk) - 1:
-                logging.debug(f"Row {rownum}: {row!r}")
-            if expected_length is not None and len(row) != expected_length:
-                logging.error(f"[VALIDATION ERROR] Row {rownum} length {len(row)} does not match expected {expected_length}: {row}")
-                raise Exception(f"Row {rownum} length {len(row)} does not match expected {expected_length}: {row}")
-            for idx, val in enumerate(row):
-                field_label = field_names[idx] if field_names and idx < len(field_names) else str(idx)
-                if isinstance(val, (list, dict)):
-                    logging.error(f"[VALIDATION ERROR] Row {rownum}, column '{field_label}' is a {type(val).__name__}: {val!r}")
-                    raise Exception(f"Row {rownum}, column '{field_label}' is a {type(val).__name__}: {val!r}")
-                if isinstance(val, bytes):
-                    logging.warning(f"Row {rownum}, column '{field_label}' is bytes: {val!r} (len={len(val)})")
-        if chunk:
-            logging.info("Column types for first row: " + str([type(val).__name__ for val in chunk[0]]))
-        # END DATA VALIDATION AND LOGGING
+            row_length = len(row) if isinstance(row, (tuple, list)) else len(field_names)
+            if expected_length is not None and row_length != expected_length:
+                logging.error(f"[VALIDATION ERROR] Row {rownum} length {row_length} does not match expected {expected_length}: {row}")
+                raise Exception(f"Row {rownum} length {row_length} does not match expected {expected_length}: {row}")
 
         retry = 0
-        duplicates = 0
-        truncation = 0
         while retry < 5:
             try:
-                logging.info(f"Inserting chunk: {len(chunk)} rows into table {table_name}.")
+                try:
+                    cursor.fast_executemany = True
+                except Exception:
+                    pass
+                logging.info(f"Inserting chunk of {len(chunk)} rows into table {table_name}...")
                 cursor.executemany(sql, chunk)
                 conn.commit()
-                logging.info(f"Finished insert for {table_name} of {len(chunk)} rows")
-                break
-            except pyodbc.OperationalError as e:
-                logging.warning(f"pyodbc.OperationalError during insert: {repr(e)}")
-                if "08S01" in str(e) or "timeout" in str(e).lower():
-                    logging.warning(f"SQL connection lost or timed out ({e}); reconnecting and retrying...")
-                    try:
-                        cursor.close()
-                        conn.close()
-                    except Exception:
-                        pass
-                    new_conn = reconnect(config)
-                    cursor = new_conn.cursor()
-                    try:
-                        cursor.fast_executemany = True
-                        logging.info("fast_executemany enabled for this platform/driver.")
-                    except Exception:
-                        logging.info("fast_executemany not available; using standard executemany.")
-                    conn = new_conn
-                    retry += 1
-                    continue
-                else:
-                    logging.exception(f"Operational error during insert into {table_name}:")
-                    raise
+                total_inserted += len(chunk)
+                break  # Done with this chunk
             except pyodbc.IntegrityError as e:
-                for row in chunk:
-                    row_retries = 0
-                    for idx, val in enumerate(row):
-                        field_label = field_names[idx] if field_names and idx < len(field_names) else str(idx)
-                        logging.debug(f"SINGLE-INSERT: Table={table_name}, Field={field_label}, Type={type(val)}, Len={len(val) if isinstance(val, str) else 'n/a'}, Val={val!r}")
-                    while row_retries < 5:
-                        try:
-                            cursor.execute(sql, row)
-                            conn.commit()
-                            break
-                        except pyodbc.IntegrityError as single_e:
-                            if "duplicate key" in str(single_e).lower() or "primary key" in str(single_e).lower():
-                                duplicates += 1
-                                break
-                            elif "foreign key" in str(single_e).lower():
-                                break
-                            else:
-                                logging.exception(f"Database error during per-row insert into {table_name}:")
-                                break
-                        except pyodbc.DataError as data_e:
-                            if "22001" in str(data_e):
-                                truncation += 1
-                                if truncation == 1:
-                                    logging.warning(f"String truncation (22001) error for a row in {table_name}; further occurrences in this batch will be skipped silently.")
-                                break
-                            else:
-                                logging.error(f"DataError: {data_e}. Row was: {row}")
-                                break
-                        except pyodbc.OperationalError as single_e:
-                            logging.warning(f"pyodbc.OperationalError during per-row insert: {repr(single_e)}")
-                            if "08S01" in str(single_e) or "timeout" in str(single_e).lower():
-                                logging.warning(f"SQL connection lost or timed out during per-row insert ({single_e}); reconnecting and retrying...")
-                                try:
-                                    cursor.close()
-                                    conn.close()
-                                except Exception:
-                                    pass
-                                new_conn = reconnect(config)
-                                cursor = new_conn.cursor()
-                                try:
-                                    cursor.fast_executemany = True
-                                    logging.info("fast_executemany enabled for this platform/driver.")
-                                except Exception:
-                                    logging.info("fast_executemany not available; using standard executemany.")
-                                conn = new_conn
-                                row_retries += 1
-                                continue
-                            else:
-                                logging.exception(f"Operational error during per-row insert into {table_name}:")
-                                break
-                        except pyodbc.Error as single_e:
-                            if "HY090" in str(single_e):
-                                logging.warning(f"Skipping row due to invalid string or buffer length (HY090) for table {table_name}: {row}")
-                                break
-                            else:
-                                logging.exception(f"Unknown error during per-row insert into {table_name}:")
-                                break
-                        break
-                break
-        label = f" for table '{table_name}'" if table_name else ""
-        logging.info(f"Committed batch {i + len(chunk)} / {len(data)}{label}")
-        if duplicates > 0:
-            logging.info(f"Skipped {duplicates} duplicate key(s) in {table_name} in this batch.")
-        if truncation > 0:
-            logging.warning(f"Skipped {truncation} row(s) in {table_name} due to string truncation in this batch.")
-    try:
-        cursor.close()
-    except Exception:
-        pass
-    try:
-        conn.close()
-    except Exception:
-        pass
+                # Log and skip duplicate primary key errors, otherwise re-raise
+                if 'PRIMARY KEY' in str(e) or 'duplicate' in str(e).lower():
+                    logging.warning(f"Duplicate key error in chunk (some or all rows already exist) for {table_name}: {e}")
+                    conn.rollback()
+                    break
+                else:
+                    logging.error(f"Integrity error in {table_name}: {e}")
+                    conn.rollback()
+                    retry += 1
+                    time.sleep(2)
+            except Exception as e:
+                logging.error(f"Error during insert for {table_name}: {e}")
+                conn.rollback()
+                retry += 1
+                time.sleep(2)
+        logging.info(f"Committed batch {min(i+len(chunk), total)} / {total} for table '{table_name}'")
 
-def parallel_child_inserts(child_tables, config, child_columns):
+    logging.info(f"Batch insert finished for {table_name}. {total_inserted} rows attempted (duplicates skipped by SQL Server).")
+def deduplicate_child_rows(rows):
+    """
+    Deduplicate (requestId, value) pairs for child table inserts.
+    Accepts a list of tuples: (requestId, value)
+    Returns a new list with duplicates removed.
+    """
+    seen = set()
+    deduped = []
+    for row in rows:
+        key = (row[0], row[1])  # (requestId, value)
+        if key not in seen:
+            deduped.append(row)
+            seen.add(key)
+    return deduped
+
+
+def parallel_child_inserts(child_tables, config, child_columns, allowed_request_ids=None):
     def child_insert_worker(args):
         table, rows = args
         if not rows:
             return
+        # Only allow rows with allowed_request_ids (FK safe)
+        if allowed_request_ids is not None:
+            rows = [row for row in rows if row[0] in allowed_request_ids]
+        if not rows:
+            return
+        # Deduplicate here!
+        rows = deduplicate_child_rows(rows)
         conn = connect(config)
         try:
             cursor = conn.cursor()
@@ -412,6 +348,7 @@ def parallel_child_inserts(child_tables, config, child_columns):
                 request_id, val = row
                 validated_val = truncate_value(val, column, CHILD_FIELD_LIMITS[column])
                 validated_rows.append((truncate_value(request_id, 'requestId', FIELD_SIZE_LIMITS['requestId']), validated_val))
+            # No need to deduplicate again here, it's already done
             sql = f"INSERT INTO {table} (requestId, {column}) VALUES (?, ?)"
             batch_insert(cursor, sql, validated_rows, config=config, table_name=table, field_names=['requestId', column])
         finally:
@@ -453,6 +390,9 @@ def write_to_mssql(config, events):
         'userRiskData_risk', 'userRiskData_score', 'userRiskData_status',
         'userRiskData_trust', 'userRiskData_username', 'userRiskData_uuid'
     ]
+    # --- Build main and child row lists
+    row_request_ids = []  # keep list of main requestIds as you go
+    child_table_raw_rows = {k: [] for k in child_tables}
     for idx, event in enumerate(events, 1):
         ad = event.get("attackData", {})
         bot = event.get("botData", {})
@@ -464,6 +404,7 @@ def write_to_mssql(config, events):
         if not request_id or request_id in seen_request_ids:
             continue
         seen_request_ids.add(request_id)
+        row_request_ids.append(request_id)
         row_dict = {
             'requestId': request_id,
             'format': event.get("format"),
@@ -525,33 +466,16 @@ def write_to_mssql(config, events):
                 continue
             for v in decode_and_split(val):
                 v_trunc = truncate_value(v, column, CHILD_FIELD_LIMITS[column])
-                child_tables[table].append(
+                child_table_raw_rows[table].append(
                     (truncate_value(request_id, 'requestId', FIELD_SIZE_LIMITS['requestId']), v_trunc)
                 )
         if idx % 1000 == 0 or idx == total:
             percent = (idx / total) * 100
             logging.info(f"Progress: {idx}/{total} ({percent:.1f}%)")
-    main_sql = f"""
-        INSERT INTO {config['SQL_TABLE']} (
-            requestId, format, type, version, responseSegment,
-            attackData_apiId, attackData_apiKey, attackData_clientIP,
-            attackData_clientReputation, attackData_configId, attackData_policyId,
-            attackData_slowPostAction, attackData_slowPostRate, attackData_custom,
-            botData_botScore,
-            clientData_appBundleId, clientData_appVersion, clientData_sdkVersion, clientData_telemetryType,
-            geo_asn, geo_city, geo_continent, geo_country, geo_regionCode,
-            httpMessage_bytes, httpMessage_host, httpMessage_method,
-            httpMessage_path, httpMessage_port, httpMessage_protocol,
-            httpMessage_query, httpMessage_start, httpMessage_status, httpMessage_tls,
-            userRiskData_allow, userRiskData_general, userRiskData_originUserId,
-            userRiskData_risk, userRiskData_score, userRiskData_status,
-            userRiskData_trust, userRiskData_username, userRiskData_uuid
-        ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-        )
-    """
-    # Deduplicate by requestId before insert!
+    # --- Deduplicate and insert main rows
     deduped_rows = deduplicate_by_request_id(main_rows, key_index=0)
+    # Only requestIds that will actually be inserted/attempted
+    main_insert_request_ids = set(row[0] for row in deduped_rows)
     if len(deduped_rows) < len(main_rows):
         logging.warning(f"Deduplicated {len(main_rows) - len(deduped_rows)} duplicate requestIds before insert.")
     conn = connect(config)
@@ -562,6 +486,25 @@ def write_to_mssql(config, events):
             logging.info("fast_executemany enabled for this platform/driver (main table).")
         except Exception:
             logging.info("fast_executemany not available (main table); using standard executemany.")
+        main_sql = f"""
+            INSERT INTO {config['SQL_TABLE']} (
+                requestId, format, type, version, responseSegment,
+                attackData_apiId, attackData_apiKey, attackData_clientIP,
+                attackData_clientReputation, attackData_configId, attackData_policyId,
+                attackData_slowPostAction, attackData_slowPostRate, attackData_custom,
+                botData_botScore,
+                clientData_appBundleId, clientData_appVersion, clientData_sdkVersion, clientData_telemetryType,
+                geo_asn, geo_city, geo_continent, geo_country, geo_regionCode,
+                httpMessage_bytes, httpMessage_host, httpMessage_method,
+                httpMessage_path, httpMessage_port, httpMessage_protocol,
+                httpMessage_query, httpMessage_start, httpMessage_status, httpMessage_tls,
+                userRiskData_allow, userRiskData_general, userRiskData_originUserId,
+                userRiskData_risk, userRiskData_score, userRiskData_status,
+                userRiskData_trust, userRiskData_username, userRiskData_uuid
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+        """
         batch_insert(cursor, main_sql, deduped_rows, config=config, batch_size=config["BATCH_SIZE"], table_name=config['SQL_TABLE'], field_names=main_row_fields)
     except Exception as e:
         logging.exception("Main table insert failed: %s", e)
@@ -570,7 +513,10 @@ def write_to_mssql(config, events):
             conn.close()
         except Exception:
             pass
-    parallel_child_inserts(child_tables, config, child_columns)
+    # --- Only include child rows for parent rows that were in main_insert_request_ids
+    for table in child_tables:
+        child_tables[table] = [row for row in child_table_raw_rows[table] if row[0] in main_insert_request_ids]
+    parallel_child_inserts(child_tables, config, child_columns, allowed_request_ids=main_insert_request_ids)
     logging.info(f"Inserted {total} events and child records into MSSQL.")
 
 def main():
