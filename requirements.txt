@@ -9,4 +9,4 @@ urllib3==2.4.0
 
 
 # SQL Server access via pyodbc
-pyodbc==5.1.0
+pyodbc==5.2.0

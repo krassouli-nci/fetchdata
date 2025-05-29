@@ -73,25 +73,25 @@ CHILD_FIELD_LIMITS = {
 }
 
 def truncate_value(value, field_name, max_length):
-    if value is None or max_length is None:
-        return value
-    # Handle bytes
-    if isinstance(value, bytes):
-        try:
-            value = value.decode('utf-8', errors='replace')
-        except Exception:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value.strip() == "":
+            return None
+    if max_length is not None:
+        if isinstance(value, bytes):
+            try:
+                value = value.decode('utf-8', errors='replace')
+            except Exception:
+                value = str(value)
+        if isinstance(value, (list, dict)):
+            logging.warning(f"Field '{field_name}' received a {type(value).__name__}; converting to string: {value!r}")
             value = str(value)
-    # Handle list/dict (convert to str or None)
-    if isinstance(value, (list, dict)):
-        logging.warning(f"Field '{field_name}' received a {type(value).__name__}; converting to string: {value!r}")
-        value = str(value)
-    # Force everything else to string except int, float, bool
-    if not isinstance(value, (str, int, float, bool)):
-        value = str(value)
-    # Now check length for string fields
-    if isinstance(value, str) and len(value) > max_length:
-        logging.warning(f"Value for '{field_name}' truncated to {max_length} chars. Original: {value[:200]!r}...")
-        return value[:max_length]
+        if not isinstance(value, (str, int, float, bool)):
+            value = str(value)
+        if isinstance(value, str) and len(value) > max_length:
+            logging.warning(f"Value for '{field_name}' truncated to {max_length} chars. Original: {value[:200]!r}...")
+            return value[:max_length]
     return value
 
 def setup_logging():
@@ -139,10 +139,8 @@ def create_session(client_token, client_secret, access_token):
     )
     return session
 
-def fetch_events(session, host, config_id):
+def fetch_events(session, host, config_id, limit=20000):
     url = f"https://{host}/siem/v1/configs/{config_id}"
-    limit = 20000
-    events = []
     to_file = Path(".akamai_to")
     now = int(datetime.now(timezone.utc).timestamp())
     try:
@@ -164,6 +162,7 @@ def fetch_events(session, host, config_id):
         if not lines:
             logging.info("No data returned.")
             break
+        events = []
         num_events = len(lines) - 1
         logging.info(f"Batch {batch_number}: Retrieved {num_events} events")
         batch_number += 1
@@ -176,6 +175,7 @@ def fetch_events(session, host, config_id):
             except json.JSONDecodeError as e:
                 logging.warning(f"Skipping malformed JSON event line: {line[:200]}... Error: {e}")
                 continue
+        yield events
         try:
             offset_context = json.loads(lines[-1])
             if offset_context.get("total", 1) == 0:
@@ -188,10 +188,9 @@ def fetch_events(session, host, config_id):
             logging.error(f"Failed to parse offset context (last line: {lines[-1][:200]}...). Stopping. Error: {e}")
             break
     try:
-        to_file.write_text(str(to_time+1))
+        to_file.write_text(str(to_time + 1))
     except Exception as e:
         logging.warning(f"Failed to write .akamai_to file: {e}")
-    return events
 
 def decode_and_split(value_string):
     seen = set()
@@ -238,8 +237,9 @@ def reconnect(config, retry_wait=5, max_retries=5):
             cursor = conn.cursor()
             try:
                 cursor.fast_executemany = True
+                logging.info("fast_executemany enabled for this platform/driver.")
             except Exception:
-                pass
+                logging.info("fast_executemany not available; using standard executemany.")
             cursor.execute("SELECT 1")
             cursor.fetchall()
             cursor.close()
@@ -252,22 +252,49 @@ def reconnect(config, retry_wait=5, max_retries=5):
                 raise
             time.sleep(retry_wait)
 
+def deduplicate_by_request_id(rows, key_index=0):
+    seen = set()
+    deduped = []
+    for row in rows:
+        req_id = row[key_index]
+        if req_id not in seen:
+            deduped.append(row)
+            seen.add(req_id)
+    return deduped
+
 def batch_insert(cursor, sql, data, config=None, batch_size=5000, table_name="", field_names=None):
     conn = cursor.connection
     for i in range(0, len(data), batch_size):
         chunk = data[i:i+batch_size]
-        # DEBUG: Print field types and lengths for each row in this chunk before batch insert
+        expected_length = len(field_names) if field_names else None
+
+        # BEGIN DATA VALIDATION AND LOGGING
         for rownum, row in enumerate(chunk):
+            if rownum < 5 or rownum == len(chunk) - 1:
+                logging.debug(f"Row {rownum}: {row!r}")
+            if expected_length is not None and len(row) != expected_length:
+                logging.error(f"[VALIDATION ERROR] Row {rownum} length {len(row)} does not match expected {expected_length}: {row}")
+                raise Exception(f"Row {rownum} length {len(row)} does not match expected {expected_length}: {row}")
             for idx, val in enumerate(row):
                 field_label = field_names[idx] if field_names and idx < len(field_names) else str(idx)
-                logging.debug(f"BATCH-INSERT: Table={table_name}, Row={rownum}, Field={field_label}, Type={type(val)}, Len={len(val) if isinstance(val, str) else 'n/a'}, Val={val!r}")
+                if isinstance(val, (list, dict)):
+                    logging.error(f"[VALIDATION ERROR] Row {rownum}, column '{field_label}' is a {type(val).__name__}: {val!r}")
+                    raise Exception(f"Row {rownum}, column '{field_label}' is a {type(val).__name__}: {val!r}")
+                if isinstance(val, bytes):
+                    logging.warning(f"Row {rownum}, column '{field_label}' is bytes: {val!r} (len={len(val)})")
+        if chunk:
+            logging.info("Column types for first row: " + str([type(val).__name__ for val in chunk[0]]))
+        # END DATA VALIDATION AND LOGGING
+
         retry = 0
         duplicates = 0
         truncation = 0
         while retry < 5:
             try:
+                logging.info(f"Inserting chunk: {len(chunk)} rows into table {table_name}.")
                 cursor.executemany(sql, chunk)
                 conn.commit()
+                logging.info(f"Finished insert for {table_name} of {len(chunk)} rows")
                 break
             except pyodbc.OperationalError as e:
                 logging.warning(f"pyodbc.OperationalError during insert: {repr(e)}")
@@ -282,8 +309,9 @@ def batch_insert(cursor, sql, data, config=None, batch_size=5000, table_name="",
                     cursor = new_conn.cursor()
                     try:
                         cursor.fast_executemany = True
+                        logging.info("fast_executemany enabled for this platform/driver.")
                     except Exception:
-                        pass
+                        logging.info("fast_executemany not available; using standard executemany.")
                     conn = new_conn
                     retry += 1
                     continue
@@ -293,7 +321,6 @@ def batch_insert(cursor, sql, data, config=None, batch_size=5000, table_name="",
             except pyodbc.IntegrityError as e:
                 for row in chunk:
                     row_retries = 0
-                    # DEBUG: Print field types and lengths before single row insert
                     for idx, val in enumerate(row):
                         field_label = field_names[idx] if field_names and idx < len(field_names) else str(idx)
                         logging.debug(f"SINGLE-INSERT: Table={table_name}, Field={field_label}, Type={type(val)}, Len={len(val) if isinstance(val, str) else 'n/a'}, Val={val!r}")
@@ -333,13 +360,21 @@ def batch_insert(cursor, sql, data, config=None, batch_size=5000, table_name="",
                                 cursor = new_conn.cursor()
                                 try:
                                     cursor.fast_executemany = True
+                                    logging.info("fast_executemany enabled for this platform/driver.")
                                 except Exception:
-                                    pass
+                                    logging.info("fast_executemany not available; using standard executemany.")
                                 conn = new_conn
                                 row_retries += 1
                                 continue
                             else:
                                 logging.exception(f"Operational error during per-row insert into {table_name}:")
+                                break
+                        except pyodbc.Error as single_e:
+                            if "HY090" in str(single_e):
+                                logging.warning(f"Skipping row due to invalid string or buffer length (HY090) for table {table_name}: {row}")
+                                break
+                            else:
+                                logging.exception(f"Unknown error during per-row insert into {table_name}:")
                                 break
                         break
                 break
@@ -358,7 +393,6 @@ def batch_insert(cursor, sql, data, config=None, batch_size=5000, table_name="",
     except Exception:
         pass
 
-
 def parallel_child_inserts(child_tables, config, child_columns):
     def child_insert_worker(args):
         table, rows = args
@@ -369,10 +403,10 @@ def parallel_child_inserts(child_tables, config, child_columns):
             cursor = conn.cursor()
             try:
                 cursor.fast_executemany = True
+                logging.info("fast_executemany enabled for this platform/driver (child table).")
             except Exception:
-                pass
+                logging.info("fast_executemany not available (child table); using standard executemany.")
             column = child_columns[table]
-            # FIELD SIZE VALIDATION/TRUNCATION FOR CHILD TABLES
             validated_rows = []
             for row in rows:
                 request_id, val = row
@@ -392,20 +426,14 @@ def write_to_mssql(config, events):
     main_rows = []
     child_tables = {
         "akamai_attack_ruleActions": [],
-        #"akamai_attack_ruleData": [],
-        #"akamai_attack_ruleMessages": [],
         "akamai_attack_ruleSelectors": [],
         "akamai_attack_ruleTags": [],
-        #"akamai_attack_ruleVersions": [],
         "akamai_attack_rules": [],
     }
     child_columns = {
         "akamai_attack_ruleActions": "rule_action",
-        #"akamai_attack_ruleData": "rule_data",
-        #"akamai_attack_ruleMessages": "rule_message",
         "akamai_attack_ruleSelectors": "rule_selector",
         "akamai_attack_ruleTags": "rule_tag",
-        #"akamai_attack_ruleVersions": "rule_version",
         "akamai_attack_rules": "rule_id",
     }
     seen_request_ids = set()
@@ -489,11 +517,8 @@ def write_to_mssql(config, events):
         main_rows.append(tuple(validated_row))
         for table, column, val in [
             ("akamai_attack_ruleActions", "rule_action", ad.get("ruleActions")),
-            #("akamai_attack_ruleData", "rule_data", ad.get("ruleData")),
-            #("akamai_attack_ruleMessages", "rule_message", ad.get("ruleMessages")),
             ("akamai_attack_ruleSelectors", "rule_selector", ad.get("ruleSelectors")),
             ("akamai_attack_ruleTags", "rule_tag", ad.get("ruleTags")),
-            #("akamai_attack_ruleVersions", "rule_version", ad.get("ruleVersions")),
             ("akamai_attack_rules", "rule_id", ad.get("rules")),
         ]:
             if not val:
@@ -525,14 +550,19 @@ def write_to_mssql(config, events):
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
     """
+    # Deduplicate by requestId before insert!
+    deduped_rows = deduplicate_by_request_id(main_rows, key_index=0)
+    if len(deduped_rows) < len(main_rows):
+        logging.warning(f"Deduplicated {len(main_rows) - len(deduped_rows)} duplicate requestIds before insert.")
     conn = connect(config)
     try:
         cursor = conn.cursor()
         try:
             cursor.fast_executemany = True
+            logging.info("fast_executemany enabled for this platform/driver (main table).")
         except Exception:
-            pass
-        batch_insert(cursor, main_sql, main_rows, config=config, batch_size=config["BATCH_SIZE"], table_name=config['SQL_TABLE'], field_names=main_row_fields)
+            logging.info("fast_executemany not available (main table); using standard executemany.")
+        batch_insert(cursor, main_sql, deduped_rows, config=config, batch_size=config["BATCH_SIZE"], table_name=config['SQL_TABLE'], field_names=main_row_fields)
     except Exception as e:
         logging.exception("Main table insert failed: %s", e)
     finally:
@@ -543,72 +573,6 @@ def write_to_mssql(config, events):
     parallel_child_inserts(child_tables, config, child_columns)
     logging.info(f"Inserted {total} events and child records into MSSQL.")
 
-def group_events(events):
-    seen_request_ids = set()
-    by_hostname = defaultdict(int)
-    by_category = defaultdict(int)
-    by_path = defaultdict(int)
-    by_method = defaultdict(int)
-    by_tls_fingerprint = defaultdict(int)
-    by_rule_action = defaultdict(int)
-    for event in events:
-        try:
-            http = event.get("httpMessage", {})
-            request_context = event.get("requestContext", {})
-            attack_data = event.get("attackData", {})
-            request_id = http.get("requestId")
-            if not request_id or request_id in seen_request_ids:
-                continue
-            seen_request_ids.add(request_id)
-            hostname = http.get("host", "unknown")
-            path = http.get("path", "unknown")
-            method = http.get("method", "unknown")
-            tls_fingerprint = request_context.get("clientTlsFingerprint", "unknown")
-            by_hostname[hostname] += 1
-            by_path[path] += 1
-            by_method[method] += 1
-            by_tls_fingerprint[tls_fingerprint] += 1
-            raw_actions = attack_data.get("ruleActions", "")
-            if raw_actions:
-                for action_decoded in decode_and_split(raw_actions):
-                    if action_decoded:
-                        by_rule_action[action_decoded] += 1
-            raw_tags = attack_data.get("ruleTags", "")
-            if raw_tags:
-                for tag_decoded in decode_and_split(raw_tags):
-                    if tag_decoded:
-                        by_category[tag_decoded] += 1
-        except Exception as e:
-            logging.warning(f"Error processing event for grouping: {e}")
-            continue
-    return {
-        "by_hostname": by_hostname,
-        "by_category": by_category,
-        "by_path": by_path,
-        "by_method": by_method,
-        "by_tls_fingerprint": by_tls_fingerprint,
-        "by_rule_action": by_rule_action,
-    }
-
-def write_output(data, output_directory="output"):
-    output_dir = Path(__file__).resolve().parent / output_directory
-    output_dir.mkdir(exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = output_dir / f"akamai_output_{timestamp}.txt"
-    with output_path.open("w", encoding='utf-8') as f:
-        def write_section(title, counter):
-            f.write(f"{title}:\n")
-            for key, count in sorted(counter.items(), key=lambda x: (-x[1], x[0])):
-                f.write(f"{key}: {count}\n")
-            f.write("\n")
-        write_section("Requests by Hostname", data["by_hostname"])
-        write_section("Requests by Category (Rule Tags)", data["by_category"])
-        write_section("Requests by Path", data["by_path"])
-        write_section("Requests by Method", data["by_method"])
-        write_section("Requests by TLS Fingerprint", data["by_tls_fingerprint"])
-        write_section("Requests by Rule Action", data["by_rule_action"])
-    logging.info(f"Output written to {output_path}")
-
 def main():
     try:
         setup_logging()
@@ -618,21 +582,19 @@ def main():
             config["AKAMAI_CLIENT_SECRET"],
             config["AKAMAI_ACCESS_TOKEN"],
         )
-        events = fetch_events(session, config["AKAMAI_HOST"], config["AKAMAI_SIEM_CONFIG_ID"])
-        if not events:
+        total_events = 0
+        for batch_events in fetch_events(session, config["AKAMAI_HOST"], config["AKAMAI_SIEM_CONFIG_ID"]):
+            if not batch_events:
+                continue
+            total_events += len(batch_events)
+            logging.info(f"Processing and inserting {len(batch_events)} events in this batch (Total so far: {total_events})")
+            write_to_mssql(config, batch_events)
+            del batch_events
+            import gc; gc.collect()
+        if total_events == 0:
             logging.info("No events retrieved.")
             return 0
-        logging.info(f"Retrieved {len(events)} total events")
-        if config["OUTPUT_MODE"].lower() == "sql":
-            logging.info("Output mode: SQL. Writing data to MSSQL.")
-            write_to_mssql(config, events)
-        elif config["OUTPUT_MODE"].lower() == "txt":
-            logging.info("Output mode: TXT. Grouping and writing data to text file.")
-            grouped_data = group_events(events)
-            write_output(grouped_data)
-        else:
-            logging.error(f"Invalid OUTPUT_MODE '{config['OUTPUT_MODE']}'. Must be 'sql' or 'txt'.")
-            return 1
+        logging.info(f"Total events processed: {total_events}")
         return 0
     except Exception as e:
         logging.exception(f"Fatal error: {e}")
