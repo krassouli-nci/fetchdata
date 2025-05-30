@@ -9,6 +9,7 @@ from pathlib import Path
 from collections import defaultdict
 import time
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 
 import requests
 import pyodbc
@@ -48,7 +49,7 @@ FIELD_SIZE_LIMITS = {
     'httpMessage_path': 2048,
     'httpMessage_port': 50,
     'httpMessage_protocol': 50,
-    'httpMessage_query': None,  # <-- change here: NVARCHAR(MAX) so no limit enforced
+    'httpMessage_query': None,  # NVARCHAR(MAX)
     'httpMessage_start': 50,
     'httpMessage_status': 50,
     'httpMessage_tls': 100,
@@ -338,6 +339,49 @@ def parallel_child_inserts(child_tables, config, child_columns, allowed_unique_i
     with ThreadPoolExecutor(max_workers=config["CHILD_INSERT_WORKERS"]) as executor:
         executor.map(child_insert_worker, [(table, rows) for table, rows in child_tables.items() if rows])
 
+def get_existing_unique_ids(config, unique_ids):
+    """
+    Checks which unique_ids exist in the parent table after attempted insert.
+    Only these should be used for child inserts.
+    """
+    if not unique_ids:
+        return set()
+    conn = connect(config)
+    try:
+        cursor = conn.cursor()
+        # SQL IN limit is 2100 items, chunk if needed
+        result = set()
+        unique_ids = list(unique_ids)
+        chunk_size = 1000
+        for i in range(0, len(unique_ids), chunk_size):
+            chunk = unique_ids[i:i+chunk_size]
+            placeholders = ','.join('?' for _ in chunk)
+            sql = f"SELECT unique_id FROM {config['SQL_TABLE']} WHERE unique_id IN ({placeholders})"
+            cursor.execute(sql, chunk)
+            rows = cursor.fetchall()
+            result.update(row[0] for row in rows)
+        return result
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def compute_unique_id(event):
+    parts = [
+        str(event.get("type", "")),
+        str(event.get("format", "")),
+        str(event.get("version", "")),
+        str(event.get("responseSegment", "")),
+        str(event.get("attackData", {}).get("configId", "")),
+        str(event.get("httpMessage", {}).get("requestId", "")),
+        str(event.get("httpMessage", {}).get("start", "")),
+    ]
+    composite = "||".join(parts)
+    composite += "||" + json.dumps(event, sort_keys=True)
+    h = hashlib.sha256(composite.encode("utf-8")).hexdigest()
+    return h[:FIELD_SIZE_LIMITS['unique_id']]
+
 def write_to_mssql(config, events):
     main_rows = []
     child_tables = {
@@ -378,16 +422,14 @@ def write_to_mssql(config, events):
         geo = event.get("geo", {})
         http = event.get("httpMessage", {})
         urd = event.get("userRiskData", {})
-        request_id = http.get("requestId")
-        start = http.get("start")
-        unique_id = f"{request_id}_{start}" if request_id and start else None
+        unique_id = compute_unique_id(event)
         if not unique_id or unique_id in seen_unique_ids:
             continue
         seen_unique_ids.add(unique_id)
         row_unique_ids.append(unique_id)
         row_dict = {
             'unique_id': unique_id,
-            'requestId': request_id,
+            'requestId': http.get("requestId"),
             'format': event.get("format"),
             'type': event.get("type"),
             'version': event.get("version"),
@@ -452,11 +494,13 @@ def write_to_mssql(config, events):
         if idx % 1000 == 0 or idx == total:
             percent = (idx / total) * 100
             logging.info(f"Progress: {idx}/{total} ({percent:.1f}%)")
+
     deduped_rows = deduplicate_by_unique_id(main_rows, key_index=0)
-    main_insert_unique_ids = set(row[0] for row in deduped_rows)
+    attempted_insert_ids = set(row[0] for row in deduped_rows)
     if len(deduped_rows) < len(main_rows):
         logging.warning(f"Deduplicated {len(main_rows) - len(deduped_rows)} duplicate unique_ids before insert.")
     conn = connect(config)
+    actually_inserted_ids = set()
     try:
         cursor = conn.cursor()
         try:
@@ -484,6 +528,8 @@ def write_to_mssql(config, events):
             )
         """
         batch_insert(cursor, main_sql, deduped_rows, config=config, batch_size=config["BATCH_SIZE"], table_name=config['SQL_TABLE'], field_names=main_row_fields)
+        # After commit, query the parent table for those unique_ids we just tried to insert.
+        actually_inserted_ids = get_existing_unique_ids(config, attempted_insert_ids)
     except Exception as e:
         logging.exception("Main table insert failed: %s", e)
     finally:
@@ -491,10 +537,11 @@ def write_to_mssql(config, events):
             conn.close()
         except Exception:
             pass
+    # Only insert child rows whose unique_id is actually present in the parent table
     for table in child_tables:
-        child_tables[table] = [row for row in child_table_raw_rows[table] if row[0] in main_insert_unique_ids]
-    parallel_child_inserts(child_tables, config, child_columns, allowed_unique_ids=main_insert_unique_ids)
-    logging.info(f"Inserted {total} events and child records into MSSQL.")
+        child_tables[table] = [row for row in child_table_raw_rows[table] if row[0] in actually_inserted_ids]
+    parallel_child_inserts(child_tables, config, child_columns, allowed_unique_ids=actually_inserted_ids)
+    logging.info(f"Inserted {len(actually_inserted_ids)} parent events and child records into MSSQL.")
 
 def main():
     try:
