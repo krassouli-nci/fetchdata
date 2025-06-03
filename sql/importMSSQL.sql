@@ -1,10 +1,8 @@
 -- 1. Drop child tables first (order matters for FK constraints)
+DROP TABLE IF EXISTS akamai_events;
 DROP TABLE IF EXISTS akamai_attack_rules;
-DROP TABLE IF EXISTS akamai_attack_ruleVersions;
 DROP TABLE IF EXISTS akamai_attack_ruleTags;
 DROP TABLE IF EXISTS akamai_attack_ruleSelectors;
-DROP TABLE IF EXISTS akamai_attack_ruleMessages;
-DROP TABLE IF EXISTS akamai_attack_ruleData;
 DROP TABLE IF EXISTS akamai_attack_ruleActions;
 
 -- 2. Drop main table
@@ -59,43 +57,35 @@ CREATE TABLE akamai_events (
     modified_at DATETIME2 DEFAULT SYSUTCDATETIME()
 );
 
--- 4. Child tables now use unique_id as FK (matches code), NOT requestId
+-- 4. Child tables now use unique_id as FK and have created_at, modified_at columns
 CREATE TABLE akamai_attack_ruleActions (
     unique_id NVARCHAR(200) NOT NULL,
     rule_action NVARCHAR(4000) NULL,
+    created_at DATETIME2 DEFAULT SYSUTCDATETIME(),
+    modified_at DATETIME2 DEFAULT SYSUTCDATETIME(),
     FOREIGN KEY (unique_id) REFERENCES akamai_events(unique_id)
 );
 
 CREATE TABLE akamai_attack_ruleSelectors (
     unique_id NVARCHAR(200) NOT NULL,
     rule_selector NVARCHAR(4000) NULL,
+    created_at DATETIME2 DEFAULT SYSUTCDATETIME(),
+    modified_at DATETIME2 DEFAULT SYSUTCDATETIME(),
     FOREIGN KEY (unique_id) REFERENCES akamai_events(unique_id)
 );
 
 CREATE TABLE akamai_attack_ruleTags (
     unique_id NVARCHAR(200) NOT NULL,
     rule_tag NVARCHAR(4000) NULL,
+    created_at DATETIME2 DEFAULT SYSUTCDATETIME(),
+    modified_at DATETIME2 DEFAULT SYSUTCDATETIME(),
     FOREIGN KEY (unique_id) REFERENCES akamai_events(unique_id)
 );
 
 CREATE TABLE akamai_attack_rules (
     unique_id NVARCHAR(200) NOT NULL,
     rule_id NVARCHAR(4000) NULL,
+    created_at DATETIME2 DEFAULT SYSUTCDATETIME(),
+    modified_at DATETIME2 DEFAULT SYSUTCDATETIME(),
     FOREIGN KEY (unique_id) REFERENCES akamai_events(unique_id)
 );
-
--- 5. Trigger to update modified_at timestamp
-DROP TRIGGER IF EXISTS trg_UpdateModifiedAt ON akamai_events;
-GO
-CREATE TRIGGER trg_UpdateModifiedAt
-ON akamai_events
-AFTER UPDATE
-AS
-BEGIN
-    SET NOCOUNT ON;
-    UPDATE akamai_events
-    SET modified_at = SYSUTCDATETIME()
-    FROM akamai_events ae
-    INNER JOIN inserted i ON ae.unique_id = i.unique_id;
-END;
-GO
