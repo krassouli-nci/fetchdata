@@ -126,6 +126,7 @@ def load_config():
     config["OUTPUT_MODE"] = os.getenv("OUTPUT_MODE", "sql")
     config["BATCH_SIZE"] = int(os.getenv("BATCH_SIZE", "10000"))
     config["CHILD_INSERT_WORKERS"] = int(os.getenv("CHILD_INSERT_WORKERS", "4"))
+    config["AKAMAI_FETCH_LIMIT"] = int(os.getenv("AKAMAI_FETCH_LIMIT", "20000"))
     return config
 
 def create_session(client_token, client_secret, access_token):
@@ -576,7 +577,7 @@ def main():
         total_events = 0
         to_file = Path(".akamai_to")
 
-        for batch_events, to_time in fetch_events(session, config["AKAMAI_HOST"], config["AKAMAI_SIEM_CONFIG_ID"]):
+        for batch_events, to_time in fetch_events(session, config["AKAMAI_HOST"], config["AKAMAI_SIEM_CONFIG_ID"], limit=config["AKAMAI_FETCH_LIMIT"]):
             try:
                 if not batch_events:
                     continue
