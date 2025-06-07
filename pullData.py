@@ -74,6 +74,7 @@ CHILD_FIELD_LIMITS = {
     'rule_id': 4000,
 }
 
+
 def force_string(val):
     if val is None:
         return None
@@ -150,44 +151,39 @@ def fetch_events(session, host, config_id, limit=20000):
     logging.info(f"Fetching events from {from_time} to {to_time}")
     params = {"from": from_time, "to": to_time, "limit": limit}
     batch_number = 1
+
     while True:
-        response = session.get(url, params=params, timeout=1800)
-        if response.status_code != 200:
-            logging.error(f"Error {response.status_code}: {response.text[:200]}...")
-            break
-        lines = response.text.strip().splitlines()
-        if not lines:
-            logging.info("No data returned.")
-            break
-        events = []
-        num_events = len(lines) - 1
-        logging.info(f"Batch {batch_number}: Retrieved {num_events} events")
-        batch_number += 1
-        if num_events == 0:
-            break
-        for line in lines[:-1]:
-            try:
-                event = json.loads(line)
-                events.append(event)
-            except json.JSONDecodeError as e:
-                logging.warning(f"Skipping malformed JSON event line: {line[:200]}... Error: {e}")
-                continue
-        yield events
-        try:
-            offset_context = json.loads(lines[-1])
-            if offset_context.get("total", 1) == 0:
+        with session.get(url, params=params, timeout=1800, stream=True) as response:
+            response.raise_for_status()
+            events = []
+            offset_context = None
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+                try:
+                    event = json.loads(raw_line)
+                    if isinstance(event, dict) and 'type' in event:
+                        events.append(event)
+                    else:
+                        offset_context = event
+                except json.JSONDecodeError:
+                    logging.warning(f"Skipping malformed line: {raw_line[:200]}")
+                    continue
+
+            if not events:
+                logging.info("No data returned.")
+                break
+
+            logging.info(f"Batch {batch_number}: Retrieved {len(events)} events")
+            batch_number += 1
+            yield events, to_time
+
+            if not offset_context or offset_context.get("total", 1) == 0:
                 break
             next_offset = offset_context.get("offset")
             if not next_offset:
                 break
             params = {"offset": next_offset, "limit": limit}
-        except json.JSONDecodeError as e:
-            logging.error(f"Failed to parse offset context (last line: {lines[-1][:200]}...). Stopping. Error: {e}")
-            break
-    try:
-        to_file.write_text(str(to_time + 1))
-    except Exception as e:
-        logging.warning(f"Failed to write .akamai_to file: {e}")
 
 def decode_and_split(value_string):
     seen = set()
@@ -325,12 +321,20 @@ def parallel_child_inserts(child_tables, config, child_columns, allowed_unique_i
                 logging.info("fast_executemany not available (child table); using standard executemany.")
             column = child_columns[table]
             validated_rows = []
+            # >>> FIX: naive datetime for child table <<<
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
             for row in rows:
                 unique_id, val = row
                 validated_val = truncate_value(val, column, CHILD_FIELD_LIMITS[column])
-                validated_rows.append((truncate_value(unique_id, 'unique_id', FIELD_SIZE_LIMITS['unique_id']), validated_val))
-            sql = f"INSERT INTO {table} (unique_id, {column}) VALUES (?, ?)"
-            batch_insert(cursor, sql, validated_rows, config=config, table_name=table, field_names=['unique_id', column])
+                validated_rows.append((
+                    truncate_value(unique_id, 'unique_id', FIELD_SIZE_LIMITS['unique_id']),
+                    validated_val,
+                    now,  # created_at
+                    now   # modified_at
+                ))
+            sql = f"INSERT INTO {table} (unique_id, {column}, created_at, modified_at) VALUES (?, ?, ?, ?)"
+            batch_insert(cursor, sql, validated_rows, config=config, table_name=table,
+                         field_names=['unique_id', column, 'created_at', 'modified_at'])
         finally:
             try:
                 conn.close()
@@ -411,10 +415,13 @@ def write_to_mssql(config, events):
         'httpMessage_query', 'httpMessage_start', 'httpMessage_status', 'httpMessage_tls',
         'userRiskData_allow', 'userRiskData_general', 'userRiskData_originUserId',
         'userRiskData_risk', 'userRiskData_score', 'userRiskData_status',
-        'userRiskData_trust', 'userRiskData_username', 'userRiskData_uuid'
+        'userRiskData_trust', 'userRiskData_username', 'userRiskData_uuid',
+        'created_at', 'modified_at'
     ]
     row_unique_ids = []
     child_table_raw_rows = {k: [] for k in child_tables}
+    # >>> FIX: create naive (timezone-less) datetime for MSSQL <<<
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     for idx, event in enumerate(events, 1):
         ad = event.get("attackData", {})
         bot = event.get("botData", {})
@@ -470,7 +477,9 @@ def write_to_mssql(config, events):
             'userRiskData_status': urd.get("status"),
             'userRiskData_trust': urd.get("trust"),
             'userRiskData_username': urd.get("username"),
-            'userRiskData_uuid': urd.get("uuid")
+            'userRiskData_uuid': urd.get("uuid"),
+            'created_at': now,  # << FIXED: Naive datetime
+            'modified_at': now  # << FIXED: Naive datetime
         }
         validated_row = []
         for fname in main_row_fields:
@@ -488,17 +497,26 @@ def write_to_mssql(config, events):
                 continue
             for v in decode_and_split(val):
                 v_trunc = truncate_value(v, column, CHILD_FIELD_LIMITS[column])
-                child_table_raw_rows[table].append(
-                    (unique_id, v_trunc)
-                )
+                child_table_raw_rows[table].append((unique_id, v_trunc))
+
         if idx % 1000 == 0 or idx == total:
             percent = (idx / total) * 100
             logging.info(f"Progress: {idx}/{total} ({percent:.1f}%)")
 
+    # Deduplicate within the batch by unique_id
     deduped_rows = deduplicate_by_unique_id(main_rows, key_index=0)
+
+    # Check which unique_ids already exist in the DB
+    existing_ids = get_existing_unique_ids(config, [row[0] for row in deduped_rows])
+
+    # Filter out already existing unique_ids
+    deduped_rows = [row for row in deduped_rows if row[0] not in existing_ids]
     attempted_insert_ids = set(row[0] for row in deduped_rows)
+
     if len(deduped_rows) < len(main_rows):
-        logging.warning(f"Deduplicated {len(main_rows) - len(deduped_rows)} duplicate unique_ids before insert.")
+        skipped = len(main_rows) - len(deduped_rows)
+        logging.warning(f"Deduplicated {skipped} rows due to already existing unique_ids in DB.")
+
     conn = connect(config)
     actually_inserted_ids = set()
     try:
@@ -522,9 +540,10 @@ def write_to_mssql(config, events):
                 httpMessage_query, httpMessage_start, httpMessage_status, httpMessage_tls,
                 userRiskData_allow, userRiskData_general, userRiskData_originUserId,
                 userRiskData_risk, userRiskData_score, userRiskData_status,
-                userRiskData_trust, userRiskData_username, userRiskData_uuid
+                userRiskData_trust, userRiskData_username, userRiskData_uuid,
+                created_at, modified_at
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
         """
         batch_insert(cursor, main_sql, deduped_rows, config=config, batch_size=config["BATCH_SIZE"], table_name=config['SQL_TABLE'], field_names=main_row_fields)
@@ -543,6 +562,7 @@ def write_to_mssql(config, events):
     parallel_child_inserts(child_tables, config, child_columns, allowed_unique_ids=actually_inserted_ids)
     logging.info(f"Inserted {len(actually_inserted_ids)} parent events and child records into MSSQL.")
 
+
 def main():
     try:
         setup_logging()
@@ -552,22 +572,43 @@ def main():
             config["AKAMAI_CLIENT_SECRET"],
             config["AKAMAI_ACCESS_TOKEN"],
         )
+
         total_events = 0
-        for batch_events in fetch_events(session, config["AKAMAI_HOST"], config["AKAMAI_SIEM_CONFIG_ID"]):
-            if not batch_events:
-                continue
-            total_events += len(batch_events)
-            logging.info(f"Processing and inserting {len(batch_events)} events in this batch (Total so far: {total_events})")
-            write_to_mssql(config, batch_events)
-            del batch_events
-            import gc; gc.collect()
+        to_file = Path(".akamai_to")
+
+        for batch_events, to_time in fetch_events(session, config["AKAMAI_HOST"], config["AKAMAI_SIEM_CONFIG_ID"]):
+            try:
+                if not batch_events:
+                    continue
+
+                total_events += len(batch_events)
+                logging.info(f"Processing and inserting {len(batch_events)} events in this batch (Total so far: {total_events})")
+
+                write_to_mssql(config, batch_events)
+
+                # Only update .akamai_to after successful processing of the batch
+                try:
+                    to_file.write_text(str(to_time + 1))
+                    logging.info(f"Checkpoint updated in .akamai_to: {to_time + 1}")
+                except Exception as e:
+                    logging.warning(f"Failed to write .akamai_to file after processing: {e}")
+
+                del batch_events
+                import gc; gc.collect()
+
+            except Exception as batch_error:
+                logging.error("Error during batch processing. Will NOT update .akamai_to. Batch will be retried on next run.")
+                raise batch_error
+
         if total_events == 0:
             logging.info("No events retrieved.")
             return 0
+
         logging.info(f"Total events processed: {total_events}")
         return 0
+
     except Exception as e:
-        logging.exception(f"Fatal error: {e}")
+        logging.exception("Fatal error encountered during execution. Reprocessing will occur on next run.")
         return 2
 
 if __name__ == "__main__":
